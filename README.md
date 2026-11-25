@@ -125,7 +125,9 @@ instead.
     interactive session does not exit on its own: hooks mark when it works and when it waits, and once it has waited
     15 minutes with nothing to do collie-agent types `/exit`. Claude reports its own usage to collie;
   - **Codex** runs headless (`codex exec --json`), and the token usage of its turns goes to collie with the session's
-    end;
+    end. A review asks Codex for its final answer in collie's review shape (`--output-schema`: verdict, summary, reason and
+    findings with file, line, whether it blocks, severity and origin); collie-agent checks it and sends it to collie with
+    the session's end;
   - output goes to `<profile dir>/sessions/<id>/agent.log`, next to the session's private files (MCP config, hooks). When the agent exits (or the token dies, or the service
     stops, which stops it) collie-agent reports the exit code, stops the processes still running in the worktree (whatever the agent left outside its process group, such as a `nohup … &` or a dev server that daemonizes: SIGTERM, then SIGKILL after 5 seconds) and removes the worktree and the branch it created.
     Leftover worktrees from a crash are removed when `run` starts. Lifecycle reports never hold the agent up.
@@ -147,6 +149,16 @@ instead.
     { "runner_id": 13, "disabled": true }
   ]
 }
+```
+
+`session_setup` runs a command in each session's worktree before its agent starts, by the dispatch's purpose (`code`,
+`research`, `reviewer`, `qa-browser`), with `COLLIE_SESSION_ID`, `COLLIE_PURPOSE`, `COLLIE_PROJECT` and `COLLIE_CODEBASE`
+set: for example, a script of yours that gives the reviewer its own git and GitHub identity in that worktree. Its output
+goes to the session's log; if it fails (or runs past two minutes) the session stops before the agent starts. collie-agent
+knows nothing about what the command does.
+
+```json
+{ "session_setup": { "reviewer": "~/bin/use-review-identity" } }
 ```
 
 `permission_mode` (`auto`, `full` or `plan`) is the mode of every binding on this machine: when it is set, the mode
