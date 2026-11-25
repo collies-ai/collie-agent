@@ -18,6 +18,7 @@ import (
 
 	"github.com/collies-ai/collie-agent/internal/agent"
 	"github.com/collies-ai/collie-agent/internal/browser"
+	"github.com/collies-ai/collie-agent/internal/cable"
 	"github.com/collies-ai/collie-agent/internal/config"
 	"github.com/collies-ai/collie-agent/internal/machine"
 	"github.com/collies-ai/collie-agent/internal/pairing"
@@ -41,6 +42,7 @@ Usage:
   collie-agent pair [--server URL] [--name NAME] [--no-browser] [--force]
   collie-agent unpair
   collie-agent service install|uninstall|status
+  collie-agent roots add|remove <folder> | roots list
   collie-agent status
   collie-agent run
   collie-agent version
@@ -122,6 +124,8 @@ func (a *App) Run(args []string) int {
 		return a.status(profile, cmdArgs)
 	case "service":
 		return a.service(profile, cmdArgs)
+	case "roots":
+		return a.roots(profile, cmdArgs)
 	default:
 		fmt.Fprintf(a.Stderr, "collie-agent: unknown command %q\n\n%s", cmd, usage)
 		return exitUsage
@@ -295,12 +299,23 @@ func (a *App) run(p config.Profile, args []string) int {
 		logger.Print(err)
 		return exitError
 	}
-	var api agent.Heartbeater = machine.NewClient(creds.Server, creds.MachineToken, "collie-agent/"+version.Version)
+	settings, err := p.LoadSettings()
+	if err != nil {
+		logger.Print(err)
+		return exitError
+	}
+	ua := "collie-agent/" + version.Version
+	var api agent.Heartbeater = machine.NewClient(creds.Server, creds.MachineToken, ua)
 	if a.MachineAPI != nil {
 		api = a.MachineAPI(creds.Server, creds.MachineToken)
 	}
-	r := &agent.Runner{Profile: p, MachineID: creds.MachineID, API: api, Log: logger, Sleep: a.RunSleep}
-	logger.Printf("collie-agent %s running as machine #%s with %s (profile %q)", version.Version, creds.MachineID, creds.Server, p.Name)
+	r := &agent.Runner{Profile: p, MachineID: creds.MachineID, API: api, Settings: settings, Log: logger, Sleep: a.RunSleep}
+	// The full machine API turns on discovery, bindings and dispatches; the cable is the push channel for them.
+	if remote, ok := api.(agent.Remote); ok {
+		r.Remote = remote
+		r.Cable = &cable.Client{Server: creds.Server, Token: creds.MachineToken, UserAgent: ua}
+	}
+	logger.Printf("collie-agent %s running as machine #%s with %s (profile %q, %d root folders)", version.Version, creds.MachineID, creds.Server, p.Name, len(settings.RootFolders))
 	if err := r.Loop(a.ctx()); err != nil {
 		if errors.Is(err, machine.ErrRevoked) {
 			return stopped
@@ -344,6 +359,31 @@ func (a *App) status(p config.Profile, args []string) int {
 		fmt.Fprintln(w, "Connection:  running, no heartbeat yet")
 	default:
 		fmt.Fprintf(w, "Connection:  running, last heartbeat %s ago\n", time.Since(st.LastHeartbeatAt).Round(time.Second))
+	}
+	if running && st != nil && st.Connection != "" {
+		fmt.Fprintf(w, "Dispatches:  over the %s, %d running\n", st.Connection, len(st.Running))
+	}
+	if settings, err := p.LoadSettings(); err != nil {
+		fmt.Fprintf(w, "Config:      unreadable: %v\n", err)
+	} else if len(settings.RootFolders) == 0 {
+		fmt.Fprintln(w, "Roots:       none (collie-agent roots add <folder>)")
+	} else {
+		fmt.Fprintf(w, "Roots:       %s\n", strings.Join(settings.RootFolders, ", "))
+	}
+	if st != nil && st.Repos > 0 {
+		fmt.Fprintf(w, "Repos:       %d matching a codebase\n", st.Repos)
+	}
+	if st != nil {
+		for _, b := range st.Bindings {
+			line := fmt.Sprintf("Binding:     #%d %s/%s in %s", b.RunnerID, b.Project, b.Codebase, b.Folder)
+			if b.Pinned {
+				line += " (pinned)"
+			}
+			if b.Refused != "" {
+				line += " — refused: " + b.Refused
+			}
+			fmt.Fprintln(w, line)
+		}
 	}
 	if st != nil && st.LastError != "" && !st.Revoked && st.LastErrorAt.After(st.LastHeartbeatAt) {
 		fmt.Fprintf(w, "Last error:  %s (%s)\n", st.LastError, st.LastErrorAt.Local().Format(time.RFC3339))
@@ -440,4 +480,65 @@ func envFrom(getenv func(string) string) (map[string]string, error) {
 		env["XDG_CONFIG_HOME"] = v
 	}
 	return env, nil
+}
+
+// roots manages the root folders: the only places collie-agent looks for repos and the only places a binding may
+// point to. The running service reads them at start: restart it after a change.
+func (a *App) roots(p config.Profile, args []string) int {
+	if len(args) == 0 {
+		args = []string{"list"}
+	}
+	s, err := p.LoadSettings()
+	if err != nil {
+		return a.fail(err)
+	}
+	switch args[0] {
+	case "list":
+		if len(s.RootFolders) == 0 {
+			fmt.Fprintln(a.Stdout, "No root folders. Add one with `collie-agent roots add <folder>`.")
+			return exitOK
+		}
+		for _, r := range s.RootFolders {
+			fmt.Fprintln(a.Stdout, r)
+		}
+		return exitOK
+	case "add", "remove":
+		if len(args) != 2 {
+			fmt.Fprintf(a.Stderr, "usage: collie-agent roots %s <folder>\n", args[0])
+			return exitUsage
+		}
+		folder, err := config.ExpandPath(args[1])
+		if err != nil {
+			return a.fail(err)
+		}
+		idx := -1
+		for i, r := range s.RootFolders {
+			if r == folder {
+				idx = i
+			}
+		}
+		if args[0] == "add" {
+			if info, err := os.Stat(folder); err != nil || !info.IsDir() {
+				return a.fail(fmt.Errorf("%s is not a directory", folder))
+			}
+			if idx >= 0 {
+				fmt.Fprintf(a.Stdout, "%s is already a root folder.\n", folder)
+				return exitOK
+			}
+			s.RootFolders = append(s.RootFolders, folder)
+		} else {
+			if idx < 0 {
+				return a.fail(fmt.Errorf("%s is not a root folder", folder))
+			}
+			s.RootFolders = append(s.RootFolders[:idx], s.RootFolders[idx+1:]...)
+		}
+		if err := p.SaveSettings(s); err != nil {
+			return a.fail(err)
+		}
+		fmt.Fprintf(a.Stdout, "Root folders: %s\nRestart the service to apply it (collie-agent service install).\n", strings.Join(s.RootFolders, ", "))
+		return exitOK
+	default:
+		fmt.Fprintf(a.Stderr, "collie-agent: unknown roots command %q (add, remove or list)\n", args[0])
+		return exitUsage
+	}
 }

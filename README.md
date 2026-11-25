@@ -6,8 +6,9 @@ opening ports.
 
 It runs as one background service per OS user: it holds the machine's pairing and its outbound connection to collie.
 
-> Status: this version installs, pairs and keeps the machine online (heartbeat). Discovering repos, receiving
-> dispatches and running agent sessions come next.
+> Status: this version installs, pairs, keeps the machine online, reports the repos it finds, syncs its bindings and
+> receives dispatches from collie. Running agent sessions comes next: until then every dispatch is declined with that
+> reason, so collie gives the work to another runner.
 
 ## Install
 
@@ -26,8 +27,9 @@ release or `COLLIE_AGENT_INSTALL_DIR` for another directory. Running it again up
 
 ```sh
 collie-agent pair               # shows a code and opens collie in the browser; approve it there
+collie-agent roots add ~/code   # where your repos live: the only folders collie-agent looks in or works in
 collie-agent service install    # launchd user agent on macOS, systemd user unit on Linux
-collie-agent status             # pairing, connection and service
+collie-agent status             # pairing, connection, roots, bindings and service
 ```
 
 `pair` uses the OAuth device flow (RFC 8628): it prints a code and a link, opens the browser when there is one
@@ -46,7 +48,8 @@ without retrying. To pair again, run `collie-agent pair --force`.
 | `service install` | Installs and starts the background service (re-run it after an upgrade or a new pairing). |
 | `service uninstall` | Stops and removes it. |
 | `service status` | What launchd or systemd says about it (exit 0 when running). |
-| `status` | Pairing, last heartbeat, last error and the service. |
+| `roots add\|remove <folder>`, `roots list` | Manages the root folders (restart the service after a change). |
+| `status` | Pairing, last heartbeat, how dispatches arrive, roots, repos, bindings, last error and the service. |
 | `run` | Runs in the foreground: what the service runs. |
 | `version` | Prints the version. |
 
@@ -75,6 +78,43 @@ collie-agent --profile work service install   # sh.collies.collie-agent-work / c
 Its files live in `~/.config/collie-agent-work`. For strong isolation, run the second instance as another OS user
 instead.
 
+## What `run` does
+
+- **Discovery.** It finds the agent CLIs it knows (`claude`, `codex`) and their versions, and reports them in the
+  heartbeat. It scans the root folders (up to 4 levels, skipping hidden and dependency folders) for git repos, asks
+  collie for the codebases of the projects granted to this machine, and reports only the repos whose remote matches
+  one (`owner/name`, from https, `ssh://` or `git@host:` remotes, SSH host aliases included). It scans again every 10
+  minutes.
+- **Bindings.** In collie you bind a codebase found on this machine to an agent. collie-agent fetches the bindings
+  whenever collie's `bindings_version` changes. **The machine has the last word**: a binding whose folder is outside
+  the root folders (after resolving symlinks) is refused whatever collie says, and the local config can pin or
+  override any binding.
+- **Dispatches.** It holds a cable connection to collie (`wss://<server>/cable`, `MachineChannel`) and reconnects
+  with backoff; while the cable is down it long-polls `GET /machine/v1/dispatches`. Each offer is only a job
+  reference. collie-agent accepts it when the binding is usable and there is room (machine-wide and per binding), and
+  declines it with a reason otherwise.
+- A 401 anywhere means the machine was revoked: everything stops.
+
+### Local config
+
+`~/.config/collie-agent/config.json` (0600) is the machine's own settings. It overrides collie:
+
+```json
+{
+  "root_folders": ["~/code"],
+  "max_concurrency": 2,
+  "bindings": [
+    { "project": "collies", "codebase": "collie", "agents": { "code": "codex" }, "max_concurrency": 2 },
+    { "runner_id": 12, "folder": "~/code/collie-agent", "permission_mode": "plan" },
+    { "runner_id": 13, "disabled": true }
+  ]
+}
+```
+
+A pin matches a binding from collie by `runner_id`, or by `project` + `codebase` (+ `purpose`), and replaces the
+fields it sets; `disabled` turns that binding off on this machine. A pinned folder must still be inside the root
+folders. Restart the service after editing it.
+
 ## Develop
 
 Go 1.24 or newer:
@@ -87,8 +127,10 @@ shellcheck install.sh
 ```
 
 Layout: `cmd/collie-agent` (entry point) and `internal/`: `cli` (commands), `pairing` (device flow), `config`
-(profiles, credentials, state), `machine` (the `/machine/v1` API client), `agent` (the heartbeat loop and the
-single-instance lock), `service` (launchd and systemd), `browser`, `version`.
+(profiles, credentials, settings, state), `machine` (the `/machine/v1` API client), `discovery` (agent CLIs, repo
+scan, remote matching), `bindings` (local overrides and the root-folder check), `cable` (ActionCable client),
+`dispatch` (capacity and acks), `agent` (`run`: heartbeat, inventory, bindings sync, connection, single-instance
+lock), `service` (launchd and systemd), `browser`, `version`.
 
 The tests run the device flow and the heartbeat against fake collie servers, and render the launchd plist and the
 systemd unit (checked with `plutil -lint` on macOS and `systemd-analyze verify` on Linux when available).
@@ -113,6 +155,9 @@ collie-agent talks to collie over HTTPS:
 - `POST /machine/v1/heartbeat` with `Authorization: Bearer <machine_token>` and
   `{version, os, max_concurrency, agents, running}` every 30 seconds (backing off up to 5 minutes on errors). A 401
   means the machine was revoked or its token is invalid.
+- `GET /machine/v1/codebases`, `PUT /machine/v1/inventory {repos: [{codebase_id, path}]}`, `GET /machine/v1/bindings`.
+- `wss://<server>/cable` (bearer token, `Origin: <server>`, `MachineChannel`), with `GET /machine/v1/dispatches?wait=25`
+  as the fallback, and `POST /machine/v1/dispatches/:id/ack {accepted, reason}`.
 
 The full contract is in collie's docs.
 
