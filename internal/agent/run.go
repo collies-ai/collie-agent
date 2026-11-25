@@ -337,7 +337,8 @@ func (r *Runner) syncBindings(ctx context.Context) error {
 		if !b.Usable() {
 			r.logger().Printf("refusing binding %d (%s/%s): %s", b.RunnerID, b.Project, b.Codebase, b.Refused)
 		}
-		states = append(states, config.BindingState{RunnerID: b.RunnerID, Project: b.Project, Codebase: b.Codebase, Folder: b.Folder, Pinned: b.Pinned, Refused: b.Refused})
+		states = append(states, config.BindingState{RunnerID: b.RunnerID, Project: b.Project, Codebase: b.Codebase, Folder: b.Folder,
+			Purpose: b.Purpose, Pinned: b.Pinned, Refused: b.Refused, PermissionMode: b.PermissionMode, PermissionFrom: b.PermissionFrom})
 	}
 	r.updateState(func(st *config.State) { st.Bindings = states })
 	return nil

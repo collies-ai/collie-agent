@@ -18,6 +18,9 @@ type Binding struct {
 	machine.Binding
 	// Pinned says the local config changed this binding.
 	Pinned bool
+	// PermissionFrom says where PermissionMode comes from: "collie", "machine" (the config's permission_mode, which
+	// overrides collie) or "pin" (the binding's pin, which overrides both).
+	PermissionFrom string
 	// Refused is why the machine refuses it (folder outside the root folders, missing, disabled locally...).
 	Refused string
 }
@@ -25,8 +28,8 @@ type Binding struct {
 // Usable reports whether dispatches for this binding may be accepted.
 func (b Binding) Usable() bool { return b.Refused == "" }
 
-// Resolve applies the local settings to collie's bindings: pinned fields override collie's, and every folder is
-// checked against the root folders. Pins that match no binding from collie are ignored: without a runner_id from
+// Resolve applies the local settings to collie's bindings: the machine's permission mode overrides collie's, pinned
+// fields override both, and every folder is checked against the root folders. Pins that match no binding from collie are ignored: without a runner_id from
 // collie there is nothing to dispatch.
 func Resolve(server []machine.Binding, s *config.Settings) []Binding {
 	if s == nil {
@@ -34,8 +37,12 @@ func Resolve(server []machine.Binding, s *config.Settings) []Binding {
 	}
 	out := make([]Binding, 0, len(server))
 	for _, sb := range server {
-		b := Binding{Binding: sb}
+		b := Binding{Binding: sb, PermissionFrom: "collie"}
 		b.Agents = copyMap(sb.Agents)
+		if s.PermissionMode != "" {
+			b.PermissionMode = s.PermissionMode
+			b.PermissionFrom = "machine"
+		}
 		if pin := findPin(s.Bindings, sb); pin != nil {
 			b.Pinned = true
 			apply(&b, pin)
@@ -95,6 +102,7 @@ func apply(b *Binding, p *config.PinnedBinding) {
 	}
 	if p.PermissionMode != "" {
 		b.PermissionMode = p.PermissionMode
+		b.PermissionFrom = "pin"
 	}
 	if p.MaxConcurrency > 0 {
 		b.MaxConcurrency = p.MaxConcurrency

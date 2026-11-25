@@ -128,3 +128,28 @@ func TestNormalizeServer(t *testing.T) {
 		}
 	}
 }
+
+func TestPermissionModesInTheConfigAreChecked(t *testing.T) {
+	t.Setenv("COLLIE_AGENT_CONFIG_DIR", t.TempDir())
+	p, _ := Resolve("")
+	write := func(body string) {
+		t.Helper()
+		if err := os.MkdirAll(p.Dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p.SettingsPath(), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(`{"permission_mode": "full", "bindings": [{"runner_id": 1, "permission_mode": "plan"}]}`)
+	s, err := p.LoadSettings()
+	if err != nil || s.PermissionMode != "full" || s.Bindings[0].PermissionMode != "plan" {
+		t.Fatalf("LoadSettings = %+v, %v", s, err)
+	}
+	for _, body := range []string{`{"permission_mode": "pln"}`, `{"bindings": [{"runner_id": 1, "permission_mode": "bypassPermissions"}]}`} {
+		write(body)
+		if _, err := p.LoadSettings(); err == nil {
+			t.Errorf("%s: no error for an unknown permission mode", body)
+		}
+	}
+}

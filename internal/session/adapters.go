@@ -1,12 +1,16 @@
 package session
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/collies-ai/collie-agent/internal/machine"
@@ -19,6 +23,7 @@ type Launch struct {
 	Prompt         string
 	MCPURL         string
 	PermissionMode string // the binding's mode: auto, full or plan
+	Binary         string // the agent CLI's resolved path
 	// TokenEnv is the environment variable that holds the session token: adapters reference it and never write the
 	// token itself to a file or a command line, where other users could read it.
 	TokenEnv   string
@@ -101,9 +106,62 @@ type Claude struct{}
 // Binary is claude.
 func (Claude) Binary() string { return "claude" }
 
-// claudePermission maps the binding's permission mode to Claude Code's: auto edits inside the worktree, full skips every
-// prompt, plan only plans. Anything else is auto.
-var claudePermission = map[string]string{"auto": "acceptEdits", "full": "bypassPermissions", "plan": "plan"}
+// claudePermission maps the binding's permission mode to Claude Code's: auto is Claude's own auto mode (it decides
+// what needs a person and works on its own otherwise), full skips every prompt, plan only plans. Anything else is
+// auto. A Claude Code without auto mode gets acceptEdits for auto (claudeMode).
+var claudePermission = map[string]string{"auto": "auto", "full": "bypassPermissions", "plan": "plan"}
+
+// claudeModes reads the permission modes a claude CLI accepts from its --help ("choices: ..."); tests replace it.
+var claudeModes = func(binary string) []string {
+	if binary == "" {
+		return nil
+	}
+	if real, err := filepath.EvalSymlinks(binary); err == nil {
+		binary = real // the native installer links claude to the current version: an upgrade is a new path
+	}
+	if v, ok := claudeModesCache.Load(binary); ok {
+		return v.([]string)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, _ := exec.CommandContext(ctx, binary, "--help").Output()
+	modes := parseClaudeModes(string(out))
+	claudeModesCache.Store(binary, modes)
+	return modes
+}
+
+var claudeModesCache sync.Map
+
+var (
+	claudeModesFlag = regexp.MustCompile(`--permission-mode[^(]*\(choices:([^)]*)\)`)
+	quoted          = regexp.MustCompile(`"([A-Za-z]+)"`)
+)
+
+// parseClaudeModes finds the choices of --permission-mode in claude's help text, nil when it lists none.
+func parseClaudeModes(help string) []string {
+	m := claudeModesFlag.FindStringSubmatch(help)
+	if m == nil {
+		return nil
+	}
+	var modes []string
+	for _, q := range quoted.FindAllStringSubmatch(m[1], -1) {
+		modes = append(modes, q[1])
+	}
+	return modes
+}
+
+// claudeMode is the --permission-mode for the binding's mode with this claude: auto falls back to acceptEdits when
+// the CLI does not list auto (or its help could not be read).
+func claudeMode(permissionMode, binary string) string {
+	mode, ok := claudePermission[permissionMode]
+	if !ok {
+		mode = claudePermission["auto"]
+	}
+	if mode == "auto" && !slices.Contains(claudeModes(binary), "auto") {
+		return "acceptEdits"
+	}
+	return mode
+}
 
 // claudeTrust matches the question of the workspace trust dialog a folder Claude Code was never trusted in shows,
 // and nothing else: an option label such as "Yes, proceed" also appears in other dialogs. Older versions ask "Do you
@@ -169,10 +227,7 @@ func claudeTrustKeys(lines []string) ([]string, bool) {
 
 // Command writes the MCP config and the hooks settings (0600, in the session dir) and builds the claude command line.
 func (Claude) Command(l Launch) (Command, error) {
-	mode, ok := claudePermission[l.PermissionMode]
-	if !ok {
-		mode = claudePermission["auto"]
-	}
+	mode := claudeMode(l.PermissionMode, l.Binary)
 	mcp := map[string]any{"mcpServers": map[string]any{"collie": map[string]any{
 		"type":    "http",
 		"url":     l.MCPURL,

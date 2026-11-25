@@ -234,7 +234,7 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 	payload := payloadText(s.Dispatch)
 	spec, err := a.Command(Launch{
 		Name: name, Worktree: worktree, Prompt: PromptFor(s.Dispatch.Purpose, payload), MCPURL: mcpURL(s),
-		PermissionMode: s.Binding.PermissionMode, TokenEnv: TokenEnv, SessionDir: dir,
+		PermissionMode: s.Binding.PermissionMode, Binary: binary, TokenEnv: TokenEnv, SessionDir: dir,
 	})
 	if err != nil {
 		return -1, nil, err
