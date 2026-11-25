@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -83,11 +84,11 @@ func TestRescanSignalsCoalesce(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// The burst is one rescan: the first wait returns at once, the second waits for the interval (or ctx).
-	if err := r.waitInventory(ctx); err != nil {
+	if err := r.waitInventory(ctx, InventoryInterval); err != nil {
 		t.Fatalf("waitInventory = %v", err)
 	}
 	waited := make(chan error, 1)
-	go func() { waited <- r.waitInventory(ctx) }()
+	go func() { waited <- r.waitInventory(ctx, InventoryInterval) }()
 	select {
 	case err := <-waited:
 		t.Fatalf("a second rescan came from the same burst (%v)", err)
@@ -107,5 +108,56 @@ func TestNewerVersion(t *testing.T) {
 		if got := newerVersion(c.v, c.prev); got != c.want {
 			t.Errorf("newerVersion(%q, %q) = %v", c.v, c.prev, got)
 		}
+	}
+}
+
+func TestAFailedRescanIsRetriedWithBackoff(t *testing.T) {
+	f := newFakeCollie(t)
+	f.codebasesV = 1
+	r, _, _ := setup(t, f)
+	var mu sync.Mutex
+	var waits []time.Duration
+	r.Sleep = func(ctx context.Context, d time.Duration) error {
+		if d >= InventoryRetryMin && d <= InventoryRetryMax && d != HeartbeatInterval {
+			mu.Lock()
+			waits = append(waits, d)
+			mu.Unlock()
+			return shortSleep(ctx, time.Millisecond)
+		}
+		return inventorySleep(ctx, d)
+	}
+	r.Cable = &codebasesCable{cb: make(chan func(string), 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Loop(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	counts := func() (int, int) { f.mu.Lock(); defer f.mu.Unlock(); return f.codebaseGets, len(f.inventory) }
+	waitFor(t, "the first report", func() bool { _, n := counts(); return n == 1 })
+
+	// collie fails the next three codebases fetches; the version change must still be reported.
+	f.mu.Lock()
+	f.failCodebases = 3
+	f.codebasesV = 2
+	f.mu.Unlock()
+	waitFor(t, "the rescan to succeed after retries", func() bool { _, n := counts(); return n == 2 })
+	mu.Lock()
+	defer mu.Unlock()
+	if len(waits) != 3 || waits[0] != InventoryRetryMin || waits[1] != 2*InventoryRetryMin || waits[2] != 4*InventoryRetryMin {
+		t.Errorf("retry waits = %v", waits)
+	}
+}
+
+func TestAFirstVersionAfterAReportRescans(t *testing.T) {
+	r := &Runner{rescan: make(chan struct{}, 1)}
+	r.codebasesChanged("5", false) // before any report: the scan at start covers it
+	if len(r.rescan) != 0 {
+		t.Fatal("rescan before any report")
+	}
+	r2 := &Runner{rescan: make(chan struct{}, 1)}
+	r2.inventoried.Store(true)
+	r2.codebasesChanged("5", false)
+	if len(r2.rescan) != 1 {
+		t.Error("a first version seen after a report did not rescan")
 	}
 }

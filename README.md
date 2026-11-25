@@ -112,7 +112,8 @@ instead.
   where it was found and the remote that matched, with the other clones as alternatives. It scans again every 10
   minutes, and right away when collie says the codebases changed (a project enabled for this machine, a codebase added
   or its repo changed): over the cable (`codebases_changed`), or through a newer `codebases_version` in the heartbeat
-  answer while the cable is down. A burst of changes makes one rescan.
+  answer while the cable is down. A burst of changes makes one rescan, and a report that fails is retried after 5
+  seconds, doubling up to 2 minutes, instead of waiting for the next interval.
 - **Bindings.** In collie you bind a codebase found on this machine to an agent. collie-agent fetches the bindings
   whenever collie's `bindings_version` changes. **The machine has the last word**: a binding whose folder is outside
   the root folders (after resolving symlinks) is refused whatever collie says, unless discovery is on and the folder is

@@ -41,18 +41,19 @@ type fakeCollie struct {
 	codebases   []machine.Codebase
 	revokeAfter int // heartbeats before answering 401 (0: never)
 
-	mu           sync.Mutex
-	offers       []machine.Dispatch
-	acks         []ackRec
-	inventory    [][]machine.InventoryRepo
-	heartbeats   []machine.Heartbeat
-	rawHBs       []map[string]json.RawMessage // each heartbeat body as sent, to check which keys are present
-	bindingsV    int
-	codebasesV   int // sent in heartbeats when > 0
-	codebaseGets int
-	bindingsGets int
-	polls        int
-	subscribed   int
+	mu            sync.Mutex
+	offers        []machine.Dispatch
+	acks          []ackRec
+	inventory     [][]machine.InventoryRepo
+	heartbeats    []machine.Heartbeat
+	rawHBs        []map[string]json.RawMessage // each heartbeat body as sent, to check which keys are present
+	bindingsV     int
+	codebasesV    int // sent in heartbeats when > 0
+	codebaseGets  int
+	failCodebases int // answer the next GETs of codebases with a 503
+	bindingsGets  int
+	polls         int
+	subscribed    int
 }
 
 func newFakeCollie(t *testing.T) *fakeCollie {
@@ -112,7 +113,15 @@ func (f *fakeCollie) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/machine/v1/codebases":
 		f.mu.Lock()
 		f.codebaseGets++
+		fail := f.failCodebases > 0
+		if fail {
+			f.failCodebases--
+		}
 		f.mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(f.codebases)
 	case r.Method == http.MethodPut && r.URL.Path == "/machine/v1/inventory":
 		var body struct {

@@ -36,6 +36,13 @@ const MaxBackoff = 5 * time.Minute
 // InventoryInterval is how often the repos are scanned and reported again.
 const InventoryInterval = 10 * time.Minute
 
+// Inventory retries after a failed report: from InventoryRetryMin, doubling up to InventoryRetryMax, so a rescan collie
+// asked for is not lost to one transient error until the next InventoryInterval.
+const (
+	InventoryRetryMin = 5 * time.Second
+	InventoryRetryMax = 2 * time.Minute
+)
+
 // MaxCableBackoff caps the wait between cable reconnects; the long-poll runs meanwhile.
 const MaxCableBackoff = time.Minute
 
@@ -106,6 +113,9 @@ type Runner struct {
 	// codebasesVersion is the last codebases_version seen from collie, over the cable or the heartbeat.
 	cbMu             sync.Mutex
 	codebasesVersion string
+	// inventoried says a report reached collie: a first codebases_version seen after it may hide a change made in
+	// between, so it asks for a rescan.
+	inventoried atomic.Bool
 }
 
 // signalRescan asks the inventory loop for a rescan without blocking; one already pending covers this one too.
@@ -137,6 +147,9 @@ func (r *Runner) codebasesChanged(version string, fromCable bool) {
 		r.signalRescan()
 	case !fromCable && news && prev != "":
 		r.logger().Print("the codebases version changed: looking for repos again")
+		r.signalRescan()
+	case !fromCable && news && r.inventoried.Load():
+		// The first version seen came after a report: a change made between the two would be absorbed silently.
 		r.signalRescan()
 	}
 }
@@ -457,7 +470,9 @@ func (r *Runner) syncBindings(ctx context.Context) error {
 // inventoryLoop looks for repos and reports the ones that match a codebase: now, every InventoryInterval, and right
 // away when collie says the codebases changed (a rescan signal).
 func (r *Runner) inventoryLoop(ctx context.Context) error {
+	retry := time.Duration(0)
 	for {
+		wait := InventoryInterval
 		if err := r.reportInventory(ctx); err != nil {
 			if errors.Is(err, machine.ErrRevoked) {
 				return err
@@ -465,22 +480,28 @@ func (r *Runner) inventoryLoop(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			r.logger().Printf("reporting repos: %v", err)
+			// The refresh stays pending: retry soon, backing off, instead of waiting for the next interval.
+			retry = min(max(retry*2, InventoryRetryMin), InventoryRetryMax)
+			wait = retry
+			r.logger().Printf("reporting repos (retrying in %s): %v", wait, err)
 			r.noteError(err)
+		} else {
+			retry = 0
+			r.inventoried.Store(true)
 		}
-		if err := r.waitInventory(ctx); err != nil {
+		if err := r.waitInventory(ctx, wait); err != nil {
 			return nil
 		}
 	}
 }
 
-// waitInventory waits InventoryInterval (through the injectable sleep) or a rescan signal, whichever comes first. It
-// returns an error only when ctx is done.
-func (r *Runner) waitInventory(ctx context.Context) error {
+// waitInventory waits d (through the injectable sleep) or a rescan signal, whichever comes first. It returns an error
+// only when ctx is done.
+func (r *Runner) waitInventory(ctx context.Context, d time.Duration) error {
 	sleepCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- r.sleep(sleepCtx, InventoryInterval) }()
+	go func() { done <- r.sleep(sleepCtx, d) }()
 	select {
 	case <-r.rescan:
 		cancel()
