@@ -64,7 +64,7 @@ type Dispatcher struct {
 	running     map[int64]int64            // session id → runner id
 	reserved    map[int64]int64            // offers being acked: session id → runner id
 	handled     map[int64]bool             // offer (session) ids already handled, so the cable and the long-poll don't ack twice
-	rootFolders []string
+	rootFolders []bindings.Root
 }
 
 // SetBindings replaces the bindings the dispatcher accepts offers for, and the root folders their folders must stay
@@ -76,7 +76,7 @@ func (d *Dispatcher) SetBindings(bs []bindings.Binding, roots []string) {
 	}
 	d.mu.Lock()
 	d.bindings = m
-	d.rootFolders = append([]string(nil), roots...)
+	d.rootFolders = bindings.PinRoots(roots)
 	d.mu.Unlock()
 }
 
@@ -123,8 +123,9 @@ func (d *Dispatcher) Handle(ctx context.Context, m machine.Dispatch) error {
 	}
 
 	// The folder was checked when the bindings synced; check it again now, so a folder (or an ancestor) swapped for
-	// a symlink since then cannot send the session outside the root folders. The session gets the fresh path.
-	folder, err := bindings.Within(b.Folder, d.roots())
+	// a symlink since then cannot send the session outside the root folders. The roots are pinned to where they
+	// resolved at sync: a redirected root no longer counts. The session gets the fresh path.
+	folder, err := bindings.WithinPinned(b.Folder, d.roots())
 	if err != nil {
 		d.release(key)
 		return d.decline(ctx, key, m, "binding refused by the machine: "+err.Error())
@@ -176,7 +177,7 @@ func (d *Dispatcher) decline(ctx context.Context, key int64, m machine.Dispatch,
 	}
 }
 
-func (d *Dispatcher) roots() []string {
+func (d *Dispatcher) roots() []bindings.Root {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.rootFolders

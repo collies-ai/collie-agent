@@ -303,3 +303,47 @@ func TestFolderIsCheckedAgainOnEveryOffer(t *testing.T) {
 		t.Errorf("started = %+v, want the resolved %s", sess.started, real)
 	}
 }
+
+func TestARedirectedRootNoLongerCounts(t *testing.T) {
+	for _, swap := range []string{"root", "ancestor of the root"} {
+		t.Run(swap, func(t *testing.T) {
+			base, _ := filepath.EvalSymlinks(t.TempDir())
+			parent := filepath.Join(base, "home")
+			root := filepath.Join(parent, "code")
+			folder := filepath.Join(root, "collie")
+			_ = os.MkdirAll(folder, 0o755)
+			// An outside tree with the same layout, so the cached binding path still exists after the swap.
+			outside := filepath.Join(base, "evil")
+			_ = os.MkdirAll(filepath.Join(outside, "home", "code", "collie"), 0o755)
+
+			api := &fakeAPI{}
+			sess := &fakeSessions{}
+			d := &Dispatcher{API: api, Sessions: sess, MaxConcurrency: 4}
+			b := binding(1, folder, 4)
+			d.SetBindings([]bindings.Binding{b}, []string{root})
+
+			_ = d.Handle(context.Background(), offer(1, 1))
+			if len(sess.started) != 1 {
+				t.Fatalf("before the swap: started = %+v", sess.started)
+			}
+
+			// Swap the root (or its parent) for a symlink into the outside tree.
+			switch swap {
+			case "root":
+				_ = os.RemoveAll(root)
+				_ = os.Symlink(filepath.Join(outside, "home", "code"), root)
+			default:
+				_ = os.RemoveAll(parent)
+				_ = os.Symlink(filepath.Join(outside, "home"), parent)
+			}
+			_ = d.Handle(context.Background(), offer(2, 1))
+			last := api.acks[len(api.acks)-1]
+			if last.Accept || !strings.Contains(last.Reason, "root folders changed") {
+				t.Errorf("after swapping the %s: %+v", swap, last)
+			}
+			if len(sess.started) != 1 {
+				t.Errorf("a session started in the redirected tree: %+v", sess.started[1:])
+			}
+		})
+	}
+}

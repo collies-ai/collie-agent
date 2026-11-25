@@ -147,3 +147,42 @@ func copyMap(m map[string]string) map[string]string {
 	}
 	return out
 }
+
+// Root is a root folder and where it resolved (symlinks followed) when the bindings were synced.
+type Root struct {
+	Path     string
+	Resolved string
+}
+
+// PinRoots resolves the root folders now. Roots that do not resolve are left out.
+func PinRoots(roots []string) []Root {
+	out := make([]Root, 0, len(roots))
+	for _, r := range roots {
+		if res, err := filepath.EvalSymlinks(filepath.Clean(r)); err == nil {
+			out = append(out, Root{Path: r, Resolved: res})
+		}
+	}
+	return out
+}
+
+// WithinPinned is Within against roots pinned at sync time: a root (or an ancestor of it) that now resolves
+// somewhere else was redirected and no longer counts, so a swap of the root itself cannot move the boundary.
+func WithinPinned(folder string, roots []Root) (string, error) {
+	var still []string
+	redirected := false
+	for _, r := range roots {
+		res, err := filepath.EvalSymlinks(filepath.Clean(r.Path))
+		if err != nil || res != r.Resolved {
+			redirected = true
+			continue
+		}
+		still = append(still, r.Resolved)
+	}
+	if len(still) == 0 {
+		if redirected {
+			return "", errors.New("the root folders changed since the bindings were synced")
+		}
+		return "", ErrNoRoots
+	}
+	return Within(folder, still)
+}
