@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,7 +26,10 @@ type fakeAPI struct {
 	finished  []int
 	renewals  int
 	renewErr  error
-	finishErr []error // returned by successive finished calls, then nil
+	startErr  error
+	startHold chan struct{} // when set, started events wait for it to close
+	finishErr []error       // returned by successive finished calls, then nil
+	usage     []*machine.Usage
 }
 
 func (f *fakeAPI) RenewSessionToken(context.Context, int64) (time.Time, error) {
@@ -38,13 +43,19 @@ func (f *fakeAPI) RenewSessionToken(context.Context, int64) (time.Time, error) {
 }
 
 func (f *fakeAPI) SessionStarted(_ context.Context, _ int64, url string) error {
+	if f.startHold != nil {
+		<-f.startHold
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.startErr != nil {
+		return f.startErr
+	}
 	f.started = append(f.started, url)
 	return nil
 }
 
-func (f *fakeAPI) SessionFinished(_ context.Context, _ int64, code int, _ *machine.Usage) error {
+func (f *fakeAPI) SessionFinished(_ context.Context, _ int64, code int, usage *machine.Usage) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.finishErr) > 0 {
@@ -53,6 +64,7 @@ func (f *fakeAPI) SessionFinished(_ context.Context, _ int64, code int, _ *machi
 		return err
 	}
 	f.finished = append(f.finished, code)
+	f.usage = append(f.usage, usage)
 	return nil
 }
 
@@ -62,26 +74,68 @@ func (f *fakeAPI) snapshot() ([]string, []int) {
 	return append([]string(nil), f.started...), append([]int(nil), f.finished...)
 }
 
-// fakeCLI is a shell script standing in for an agent CLI. It records what it got into $FAKE_OUT/<name>/.
+// fakeCLI is a shell script standing in for an agent CLI. It records what it got into $FAKE_OUT/<name>/. As claude it
+// insists on a terminal, asks the trust question, touches its hooks' files and shows the Remote Control link as a
+// terminal hyperlink; with FAKE_IDLE it then goes idle and waits to be told to /exit. As codex it prints --json events
+// with usage.
 const fakeCLI = `#!/bin/sh
-out="$FAKE_OUT/$(basename "$0")"
+name=$(basename "$0")
+out="$FAKE_OUT/$name"
 mkdir -p "$out"
 printf '%s\n' "$@" > "$out/args"
 pwd -P > "$out/pwd"
 printf '%s' "$COLLIE_SESSION_TOKEN" > "$out/token"
 printf '%s' "$COLLIE_MCP_URL" > "$out/mcp_url"
 git rev-parse --abbrev-ref HEAD > "$out/branch" 2>/dev/null
-echo "starting"
-echo "Remote Control: https://claude.ai/code/session_01TESTabc-_9 (open it in the app)"
+git log --format=%s > "$out/log" 2>/dev/null
+if [ "$name" = claude ]; then
+  if [ ! -t 0 ] || [ ! -t 1 ]; then echo "claude: Remote Control needs a terminal" >&2; exit 9; fi
+  sdir=""
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--settings" ]; then sdir=$(dirname "$a"); fi
+    prev="$a"
+  done
+  echo "Do you trust the files in this folder?"
+  read -r answer
+  echo trusted > "$out/trusted"
+  touch "$sdir/activity"
+  printf 'Remote Control \033]8;;https://claude.ai/code/session_01TESTabc-_9\033\\/rc active\033]8;;\033\\\n'
+  if [ -n "$FAKE_IDLE" ]; then
+    touch "$sdir/idle"
+    read -r cmd
+    echo "$cmd" > "$out/typed"
+    if [ "$cmd" = "/exit" ]; then exit 0; fi
+    exit 4
+  fi
+else
+  echo '{"type":"thread.started","thread_id":"t1"}'
+  echo '{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":200,"output_tokens":300}}'
+  echo 'not json'
+  echo '{"type":"turn.completed","usage":{"input_tokens":800,"cached_input_tokens":100,"output_tokens":50}}'
+fi
+if [ -n "$FAKE_BIG" ]; then head -c 300000 /dev/zero | tr '\0' x; echo; touch "$out/wrote"; fi
 if [ -n "$FAKE_SLEEP" ]; then sleep "$FAKE_SLEEP"; fi
 exit ${FAKE_EXIT:-0}
 `
 
-// env builds a repo with one commit, fake claude and codex in PATH, and a manager.
+// gitRun runs git in dir and fails the test on an error.
+func gitRun(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// env builds a repo cloned from an origin whose default branch is main (one commit, "first"), fake claude and codex
+// in PATH, and a manager.
 func env(t *testing.T) (*Manager, *fakeAPI, string, string) {
 	t.Helper()
 	base, _ := filepath.EvalSymlinks(t.TempDir())
 	repo := filepath.Join(base, "repo")
+	origin := filepath.Join(base, "origin.git")
 	bin := filepath.Join(base, "bin")
 	out := filepath.Join(base, "out")
 	for _, d := range []string{repo, bin, out} {
@@ -98,11 +152,12 @@ func env(t *testing.T) (*Manager, *fakeAPI, string, string) {
 	t.Setenv("GIT_AUTHOR_EMAIL", "t@example.com")
 	t.Setenv("GIT_COMMITTER_NAME", "t")
 	t.Setenv("GIT_COMMITTER_EMAIL", "t@example.com")
-	for _, args := range [][]string{{"init", "-q", "-b", "main"}, {"commit", "-q", "--allow-empty", "-m", "first"}} {
-		if out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v: %s", args, err, out)
-		}
-	}
+	gitRun(t, base, "init", "-q", "--bare", "-b", "main", origin)
+	gitRun(t, repo, "init", "-q", "-b", "main")
+	gitRun(t, repo, "commit", "-q", "--allow-empty", "-m", "first")
+	gitRun(t, repo, "remote", "add", "origin", origin)
+	gitRun(t, repo, "push", "-q", "origin", "main")
+	gitRun(t, repo, "remote", "set-head", "origin", "main")
 	api := &fakeAPI{}
 	m := &Manager{API: api, Dir: filepath.Join(base, "sessions"), MaxConcurrency: 2, KillGrace: 200 * time.Millisecond, RetryWait: time.Millisecond}
 	return m, api, repo, out
@@ -167,10 +222,22 @@ func TestClaudeSessionRunsInItsWorktreeAndCleansUp(t *testing.T) {
 	}
 	args := strings.Split(read(t, filepath.Join(out, "claude", "args")), "\n")
 	joined := strings.Join(args, " ")
-	for _, want := range []string{"--remote-control collie collies #42", "--permission-mode acceptEdits", "--strict-mcp-config", "-p "} {
+	for _, want := range []string{"--remote-control collie collies #42", "--permission-mode acceptEdits", "--strict-mcp-config", "--settings " + filepath.Join(m.Dir, "42", "settings.json")} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("claude args lack %q: %q", want, args)
 		}
+	}
+	for _, a := range args {
+		if a == "-p" || a == "--print" {
+			t.Errorf("claude runs in print mode, where Remote Control does not work: %q", args)
+		}
+	}
+	// The args file has one line per argument line: the prompt (several lines) comes last, right after --settings.
+	if i := strings.Index(joined, filepath.Join(m.Dir, "42", "settings.json")+" You are collie's worker"); i < 0 || !strings.HasSuffix(joined, "</routine-fire-payload>") {
+		t.Errorf("the prompt is not the session's opening message, last: %q", joined)
+	}
+	if read(t, filepath.Join(out, "claude", "trusted")) != "trusted" {
+		t.Error("the trust dialog was not answered")
 	}
 	if !strings.Contains(joined, "<routine-fire-payload>") || !strings.Contains(joined, "collie work_goal #148 in collie") {
 		t.Errorf("the prompt does not carry the job reference: %q", joined)
@@ -488,4 +555,205 @@ func argAfter(args []string, flag string) string {
 		}
 	}
 	return ""
+}
+
+// R1-1: a session never deletes a branch it did not create.
+func TestABranchThatAlreadyExistsIsNeverDeleted(t *testing.T) {
+	m, api, repo, out := env(t)
+	gitRun(t, repo, "branch", "collie/session-21")
+	gitRun(t, repo, "commit", "-q", "--allow-empty", "-m", "unmerged work") // on main: the branch keeps its own tip
+	tip := gitRun(t, repo, "rev-parse", "collie/session-21")
+	run(t, m, session(21, "claude", repo, "auto"))
+	if got := gitRun(t, repo, "rev-parse", "collie/session-21"); got != tip {
+		t.Errorf("the existing branch moved or was deleted: %s, want %s", got, tip)
+	}
+	if _, err := os.Stat(filepath.Join(out, "claude")); !os.IsNotExist(err) {
+		t.Error("the agent ran on a branch the session did not create")
+	}
+	started, finished := api.snapshot()
+	if len(started) != 0 || len(finished) != 1 || finished[0] != -1 {
+		t.Errorf("started %q finished %v, want only finished -1", started, finished)
+	}
+}
+
+// R1-4: the session starts from the remote's default branch, never from the checkout the repo is on.
+func TestASessionStartsFromTheDefaultBranchNotTheCheckout(t *testing.T) {
+	for _, unsetHead := range []bool{false, true} {
+		m, _, repo, out := env(t)
+		gitRun(t, repo, "checkout", "-q", "-b", "feature")
+		gitRun(t, repo, "commit", "-q", "--allow-empty", "-m", "feature only")
+		if unsetHead { // origin/HEAD unknown locally: ask origin
+			gitRun(t, repo, "remote", "set-head", "origin", "--delete")
+		}
+		run(t, m, session(31, "claude", repo, "auto"))
+		if got := read(t, filepath.Join(out, "claude", "log")); got != "first" {
+			t.Errorf("unset origin/HEAD %v: the session's history is %q, want only main's", unsetHead, got)
+		}
+	}
+}
+
+func TestNoDefaultBranchFailsClearly(t *testing.T) {
+	m, api, repo, out := env(t)
+	gitRun(t, repo, "remote", "remove", "origin")
+	run(t, m, session(32, "claude", repo, "auto"))
+	if _, err := os.Stat(filepath.Join(out, "claude")); !os.IsNotExist(err) {
+		t.Error("the agent ran without a default branch to start from")
+	}
+	if _, finished := api.snapshot(); len(finished) != 1 || finished[0] != -1 {
+		t.Errorf("finished = %v", finished)
+	}
+	if err := addWorktree(context.Background(), repo, filepath.Join(t.TempDir(), "wt"), "collie/x"); err == nil || !strings.Contains(err.Error(), "default branch") {
+		t.Errorf("addWorktree = %v, want a clear default-branch error", err)
+	}
+}
+
+// R1-3: a 401 on a session endpoint stops the runner, not only the session; a 409 stays local.
+func TestA401OnASessionEndpointStopsTheRunner(t *testing.T) {
+	cases := map[string]func(*fakeAPI){
+		"renewal":         func(a *fakeAPI) { a.renewErr = fmt.Errorf("%w: 401", machine.ErrRevoked) },
+		"lifecycle event": func(a *fakeAPI) { a.startErr = fmt.Errorf("%w: 401", machine.ErrRevoked) },
+	}
+	for name, setup := range cases {
+		m, api, repo, _ := env(t)
+		setup(api)
+		t.Setenv("FAKE_SLEEP", "30")
+		ctx, cancel := context.WithCancel(context.Background())
+		var got atomic.Value
+		m.OnRevoked(func(err error) { got.Store(err); cancel() }) // what the runner does: stop everything
+		s := session(41, "claude", repo, "auto")
+		s.Accepted.ExpiresAt = time.Now()
+		m.RenewBefore = time.Hour
+		done := make(chan struct{})
+		if err := m.Start(ctx, s, func() { close(done) }); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Fatalf("%s: the revocation did not stop the session", name)
+		}
+		if err, _ := got.Load().(error); !errors.Is(err, machine.ErrRevoked) {
+			t.Errorf("%s: OnRevoked got %v", name, err)
+		}
+		cancel()
+	}
+
+	m, api, repo, _ := env(t)
+	api.renewErr = machine.ErrGone
+	revoked := false
+	m.OnRevoked(func(error) { revoked = true })
+	s := session(42, "claude", repo, "auto")
+	s.Accepted.ExpiresAt = time.Now()
+	m.RenewBefore = time.Hour
+	t.Setenv("FAKE_SLEEP", "30")
+	run(t, m, s)
+	if revoked {
+		t.Error("a session that is gone (409) stopped the runner")
+	}
+}
+
+// R1-5: the usage codex reports reaches the finished event.
+func TestCodexUsageIsReported(t *testing.T) {
+	m, api, repo, _ := env(t)
+	run(t, m, session(51, "codex", repo, "auto"))
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.usage) != 1 || api.usage[0] == nil {
+		t.Fatalf("usage = %v", api.usage)
+	}
+	u := *api.usage[0]
+	if u.InputTokens != 1700 || u.CacheReadInputTokens != 300 || u.OutputTokens != 350 {
+		t.Errorf("usage = %+v, want input 1700, cache read 300, output 350", u)
+	}
+}
+
+func TestClaudeReportsNoUsageOfItsOwn(t *testing.T) {
+	m, api, repo, _ := env(t)
+	run(t, m, session(52, "claude", repo, "auto"))
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.usage) != 1 || api.usage[0] != nil {
+		t.Errorf("usage = %v: Claude reports its usage to collie itself", api.usage)
+	}
+}
+
+// R1-6: a slow collie does not hold up the agent's output, its supervision or its shutdown.
+func TestASlowCollieDoesNotHoldUpTheAgent(t *testing.T) {
+	for _, agent := range []string{"claude", "codex"} {
+		m, api, repo, out := env(t)
+		api.startHold = make(chan struct{})
+		t.Setenv("FAKE_BIG", "1") // more output than any pipe or terminal buffer holds
+		done := make(chan struct{})
+		if err := m.Start(context.Background(), session(61, agent, repo, "auto"), func() { close(done) }); err != nil {
+			t.Fatal(err)
+		}
+		waitUntil(t, agent+" to write all its output while collie is slow", func() bool {
+			_, err := os.Stat(filepath.Join(out, agent, "wrote"))
+			return err == nil
+		})
+		close(api.startHold)
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Fatalf("%s: the session did not finish", agent)
+		}
+		started, finished := api.snapshot()
+		if len(started) == 0 || len(finished) != 1 || finished[0] != 0 {
+			t.Errorf("%s: started %q finished %v: the events must still arrive, in order", agent, started, finished)
+		}
+	}
+}
+
+func TestAnIdleClaudeSessionIsEnded(t *testing.T) {
+	m, api, repo, out := env(t)
+	t.Setenv("FAKE_IDLE", "1")
+	m.IdleTimeout = 200 * time.Millisecond
+	m.IdlePoll = 20 * time.Millisecond
+	run(t, m, session(71, "claude", repo, "auto"))
+	if got := read(t, filepath.Join(out, "claude", "typed")); got != "/exit" {
+		t.Errorf("typed %q, want /exit", got)
+	}
+	if _, finished := api.snapshot(); len(finished) != 1 || finished[0] != 0 {
+		t.Errorf("finished = %v, want 0 for an agent that exited when told", finished)
+	}
+}
+
+func TestAWorkingClaudeSessionIsNotEnded(t *testing.T) {
+	m, api, repo, _ := env(t)
+	t.Setenv("FAKE_SLEEP", "1") // active (the activity file is newer than any idle one) the whole time
+	m.IdleTimeout = 100 * time.Millisecond
+	m.IdlePoll = 20 * time.Millisecond
+	run(t, m, session(72, "claude", repo, "auto"))
+	if _, finished := api.snapshot(); len(finished) != 1 || finished[0] != 0 {
+		t.Errorf("finished = %v, want the agent's own exit", finished)
+	}
+}
+
+func TestClaudeHooksTouchTheIdleFiles(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := (Claude{}).Command(Launch{Name: "n", Worktree: dir, Prompt: "p", MCPURL: "https://x/mcp", TokenEnv: TokenEnv, SessionDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Hooks map[string][]struct {
+			Hooks []struct{ Type, Command string } `json:"hooks"`
+		} `json:"hooks"`
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "settings.json"))
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"PreToolUse": ActivityFile, "PostToolUse": ActivityFile, "UserPromptSubmit": ActivityFile, "Stop": IdleFile, "Notification": IdleFile}
+	if len(cfg.Hooks) != len(want) {
+		t.Errorf("hooks = %v", cfg.Hooks)
+	}
+	for event, file := range want {
+		h := cfg.Hooks[event]
+		if len(h) != 1 || len(h[0].Hooks) != 1 || h[0].Hooks[0].Command != "touch "+shellQuote(filepath.Join(dir, file)) {
+			t.Errorf("%s hook = %+v", event, h)
+		}
+	}
+	if fi, _ := os.Stat(filepath.Join(dir, "settings.json")); fi.Mode().Perm() != 0o600 {
+		t.Errorf("settings.json mode %o", fi.Mode().Perm())
+	}
 }

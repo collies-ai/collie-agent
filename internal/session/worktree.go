@@ -13,9 +13,10 @@ import (
 )
 
 // worktreeMeta is written next to each session's worktree, so a sweep after a crash knows which repo it belongs to.
+// Branch is set only once `git worktree add -b` created it: cleanup deletes only a branch this session created.
 type worktreeMeta struct {
 	Repo   string `json:"repo"`
-	Branch string `json:"branch"`
+	Branch string `json:"branch,omitempty"`
 }
 
 const metaFile = "session.json"
@@ -33,32 +34,74 @@ func git(ctx context.Context, dir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// defaultBase is the commit a session's branch starts from: origin's default branch when the repo knows it
-// (refreshed with a fetch that may fail offline), else the repo's HEAD.
-func defaultBase(ctx context.Context, repo string) string {
-	ref, err := git(ctx, repo, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
-	if err != nil || ref == "" {
-		return "HEAD"
+// defaultBase is where a session's branch starts: the remote's default branch, never the checkout the repo happens to
+// be on (a feature branch would carry its commits into the session's PR). It is origin/HEAD when the repo knows it,
+// else what origin says its HEAD is. The branch is fetched first, best effort: offline it starts from the last fetch.
+func defaultBase(ctx context.Context, repo string) (string, error) {
+	branch := ""
+	if ref, err := git(ctx, repo, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"); err == nil {
+		branch = strings.TrimPrefix(ref, "refs/remotes/origin/")
+	} else {
+		lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		out, lerr := git(lctx, repo, "ls-remote", "--symref", "origin", "HEAD")
+		cancel()
+		if lerr != nil {
+			return "", fmt.Errorf("cannot tell the default branch of %s: origin/HEAD is not set and origin did not answer (%v); run `git remote set-head origin --auto` there", repo, lerr)
+		}
+		branch = remoteHead(out)
+		if branch == "" {
+			return "", fmt.Errorf("cannot tell the default branch of %s: origin/HEAD is not set and origin did not say; run `git remote set-head origin <branch>` there", repo)
+		}
 	}
-	branch := strings.TrimPrefix(ref, "refs/remotes/origin/")
 	fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	_, _ = git(fctx, repo, "fetch", "--quiet", "origin", branch) // best effort: offline still works from the last fetch
-	return "origin/" + branch
+	_, _ = git(fctx, repo, "fetch", "--quiet", "origin", "+refs/heads/"+branch+":refs/remotes/origin/"+branch)
+	if _, err := git(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch+"^{commit}"); err != nil {
+		return "", fmt.Errorf("the default branch origin/%s of %s is not fetched and origin did not answer", branch, repo)
+	}
+	return "origin/" + branch, nil
 }
 
-// addWorktree creates dir as a worktree of repo on a fresh branch from the default branch, and records it so a
-// sweep can remove it if collie-agent dies.
+// remoteHead reads the branch from `git ls-remote --symref origin HEAD` ("ref: refs/heads/main\tHEAD").
+func remoteHead(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		rest, ok := strings.CutPrefix(line, "ref: refs/heads/")
+		if !ok {
+			continue
+		}
+		if branch, target, ok := strings.Cut(rest, "\t"); ok && strings.TrimSpace(target) == "HEAD" {
+			return branch
+		}
+	}
+	return ""
+}
+
+// addWorktree creates dir as a worktree of repo on a new branch from the default branch, and records it so a sweep
+// can remove it if collie-agent dies. A branch that already exists is an error, never reused or deleted.
 func addWorktree(ctx context.Context, repo, dir, branch string) error {
 	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return err
 	}
-	meta, _ := json.Marshal(worktreeMeta{Repo: repo, Branch: branch})
-	if err := os.WriteFile(filepath.Join(filepath.Dir(dir), metaFile), meta, 0o600); err != nil {
+	metaPath := filepath.Join(filepath.Dir(dir), metaFile)
+	write := func(m worktreeMeta) error {
+		b, _ := json.Marshal(m)
+		return os.WriteFile(metaPath, b, 0o600)
+	}
+	// The repo first, so a sweep can prune a half-made worktree; the branch only once this session created it.
+	if err := write(worktreeMeta{Repo: repo}); err != nil {
 		return err
 	}
-	_, err := git(ctx, repo, "worktree", "add", "-b", branch, dir, defaultBase(ctx, repo))
-	return err
+	if _, err := git(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
+		return fmt.Errorf("branch %s already exists in %s: collie-agent does not reuse or delete it", branch, repo)
+	}
+	base, err := defaultBase(ctx, repo)
+	if err != nil {
+		return err
+	}
+	if _, err := git(ctx, repo, "worktree", "add", "-b", branch, dir, base); err != nil {
+		return err
+	}
+	return write(worktreeMeta{Repo: repo, Branch: branch})
 }
 
 // removeWorktree removes the worktree and its local branch (whatever the agent pushed stays on the remote), and the

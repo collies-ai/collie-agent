@@ -94,20 +94,31 @@ instead.
   declines it with a reason otherwise (also when the binding's agent CLI is not installed).
 - **Sessions.** An accepted dispatch runs as one agent session:
   - a git worktree of the bound repo in `<profile dir>/sessions/<id>/worktree`, on a new branch
-    `collie/session-<id>` from the remote's default branch (`origin/HEAD`, else `HEAD`);
-  - the agent CLI runs there, in its own process group, with collie's runner prompt for the binding's purpose
-    (worker, `qa-browser` or `reviewer`) and the job reference appended in `<routine-fire-payload>`;
+    `collie/session-<id>` from the remote's default branch: `origin/HEAD`, or what `origin` says its HEAD is, and
+    never the branch the repo happens to be on. When neither tells, the session fails with that reason (fix it with
+    `git remote set-head origin --auto`). A `collie/session-<id>` branch that already exists is never reused or
+    deleted;
+  - the agent CLI runs there with collie's runner prompt for the binding's purpose (worker, `qa-browser` or
+    `reviewer`) and the job reference appended in `<routine-fire-payload>`;
   - it reaches collie's MCP server with a short-lived session token (1 hour, renewed 10 minutes before it expires)
     passed only in the `COLLIE_SESSION_TOKEN` environment variable: Claude Code gets an MCP config that references
     the variable, Codex `bearer_token_env_var`;
   - the binding's permission mode maps to Claude Code / Codex as `auto` → `acceptEdits` / `workspace-write`,
     `full` → `bypassPermissions` / `danger-full-access` and `plan` → `plan` / `read-only` (anything else is `auto`);
-  - Claude Code runs with `--remote-control`, and the session URL it prints is reported to collie;
-  - output goes to `<profile dir>/sessions/<id>/agent.log`. When the agent exits (or the token is revoked, or the
-    service stops, which kills it) collie-agent reports the exit code and removes the worktree and its branch.
-    Leftover worktrees from a crash are removed when `run` starts.
+  - **Claude Code** runs as an interactive session with Remote Control (`claude --remote-control <name> <prompt>`) in
+    a pseudo-terminal, so it shows in claude.ai/code and the Claude app, where you can watch it, answer its
+    permission prompts or step in. collie-agent accepts the workspace trust dialog for the new worktree and reports
+    the session's claude.ai link to collie. Remote Control needs a claude.ai login (`claude auth login`), not an API
+    key; if `claude --remote-control` asks you to enable Remote Control, run it once yourself and accept. An
+    interactive session does not exit on its own: hooks mark when it works and when it waits, and once it has waited
+    15 minutes with nothing to do collie-agent types `/exit`. Claude reports its own usage to collie;
+  - **Codex** runs headless (`codex exec --json`), and the token usage of its turns goes to collie with the session's
+    end;
+  - output goes to `<profile dir>/sessions/<id>/agent.log`. When the agent exits (or the token dies, or the service
+    stops, which stops it) collie-agent reports the exit code and removes the worktree and the branch it created.
+    Leftover worktrees from a crash are removed when `run` starts. Lifecycle reports never hold the agent up.
   - The agent runs as your OS user, with your access: bind only repos you trust collie's work in.
-- A 401 anywhere means the machine was revoked: everything stops.
+- A 401 anywhere, session endpoints included, means the machine was revoked: everything stops.
 
 ### Local config
 

@@ -191,6 +191,10 @@ func (r *Runner) Loop(ctx context.Context) error {
 		}
 		cancel()
 	}
+	// A 401 on a session endpoint (renewing a token, reporting an event) is a revocation like any other: stop it all.
+	if rv, ok := sessions.(interface{ OnRevoked(func(error)) }); ok {
+		rv.OnRevoked(r.stop)
+	}
 	var wg sync.WaitGroup
 	start := func(f func(context.Context) error) {
 		wg.Add(1)
