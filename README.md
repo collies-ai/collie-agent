@@ -95,8 +95,8 @@ instead.
     is not a documented interface, so when it is missing or unreadable collie-agent scans `~/Projects`, `~/code`,
     `~/src`, `~/dev` and `~/work` instead, up to 4 levels (source `scan`);
   - with `"discover"` including `codex`: the `[projects."<path>"]` of `~/.codex/config.toml` with
-    `trust_level = "trusted"` (source `codex`). Text inside strings and arrays is never read as config, and a file that
-    cannot be read unambiguously trusts nothing.
+    `trust_level = "trusted"` (source `codex`), read with a conforming TOML decoder: a file TOML rejects trusts
+    nothing.
 
   Missing folders, temp dirs (`/tmp`, `/var/folders`) and worktrees (`*/.claude/worktrees/*`) are skipped, and repos
   without a remote are ignored. It then asks collie for the codebases of the projects granted to this machine, and

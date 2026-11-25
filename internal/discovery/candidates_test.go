@@ -213,25 +213,26 @@ func TestSkipped(t *testing.T) {
 	}
 }
 
-func TestTOMLKeyPath(t *testing.T) {
-	for in, want := range map[string][]string{
-		`projects."/Users/a/x"]`:           {"projects", "/Users/a/x"},
-		`projects.'/Users/a/x y']`:         {"projects", "/Users/a/x y"},
-		` "projects" . "/Users/a/\"q\"" ]`: {"projects", `/Users/a/"q"`},
-		`trust_level = "trusted"`:          {"trust_level"},
-		`"trust_level" = "trusted"`:        {"trust_level"},
-		`'trust_level'= "trusted"`:         {"trust_level"},
-		`"trust\u005flevel" = 1`:           {"trust_level"},
+func TestCodexRejectsWhatTOMLRejects(t *testing.T) {
+	setTempDirs(t)
+	home := realDir(t, t.TempDir())
+	good := filepath.Join(home, "good")
+	_ = os.MkdirAll(good, 0o755)
+	for _, bad := range []string{
+		// Octal and other escapes Go accepts but TOML does not.
+		`["projects".'` + good + `']` + "\n" + `"trust\137level" = "trusted"` + "\n",
+		`[projects."` + good + `"]` + "\n" + `trust_level = "trusted\x00"` + "\n",
+		`[projects."` + good + `\a"]` + "\n" + `trust_level = "trusted"` + "\n",
 	} {
-		got, _, ok := tomlKeyPath(in)
-		if !ok || !reflect.DeepEqual(got, want) {
-			t.Errorf("tomlKeyPath(%s) = %q, %v; want %q", in, got, ok, want)
+		writeFile(t, filepath.Join(home, ".codex", "config.toml"), bad)
+		if got := codexFolders(home); len(got) != 0 {
+			t.Errorf("invalid TOML %q trusted %v", bad, got)
 		}
 	}
-	for _, bad := range []string{`= 1`, `"open = 1`, `'open = 1`, `a. = 1`} {
-		if got, _, ok := tomlKeyPath(bad); ok {
-			t.Errorf("tomlKeyPath(%s) = %q, want failure", bad, got)
-		}
+	// A trust_level that is not a string is not trusted.
+	writeFile(t, filepath.Join(home, ".codex", "config.toml"), `[projects."`+good+`"]`+"\n"+`trust_level = true`+"\n")
+	if got := codexFolders(home); len(got) != 0 {
+		t.Errorf("non-string trust_level trusted %v", got)
 	}
 }
 
@@ -306,7 +307,6 @@ trust_level = "trusted"
 		`[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n" + `["projects".'` + good + `']` + "\n" + `trust_level = "untrusted"` + "\n",
 		`projects."` + good + `".trust_level = "untrusted"` + "\n" + `[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n",
 		`[projects]` + "\n" + `"` + good + `" = { trust_level = "untrusted" }` + "\n" + `[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n",
-		`[projects."` + good + `".sub]` + "\n" + `x = 1` + "\n" + `[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n",
 		`[[projects]]` + "\n" + `x = 1` + "\n" + `[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n",
 	} {
 		write(dup)
@@ -320,9 +320,9 @@ trust_level = "trusted"
 		t.Errorf("quoted spellings: %v", got)
 	}
 
-	// A trust value that is not a plain one-line string is not trusted.
+	// Any TOML spelling of the string "trusted" is what Codex reads, so it counts too.
 	write(`[projects."` + good + `"]` + "\n" + `trust_level = """trusted"""` + "\n")
-	if got := paths(); len(got) != 0 {
-		t.Errorf("multiline trust value counted: %v", got)
+	if got := paths(); !reflect.DeepEqual(got, []string{good}) {
+		t.Errorf("multiline \"trusted\" not counted: %v", got)
 	}
 }
