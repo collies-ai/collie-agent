@@ -2,6 +2,7 @@ package machine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -35,5 +36,23 @@ func TestServerErrorIsNotRevoked(t *testing.T) {
 	var se *StatusError
 	if !errors.As(err, &se) || se.Status != 502 || errors.Is(err, ErrRevoked) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDispatchDecodesCollieMessage(t *testing.T) {
+	// Exactly what collie's MachineSession#message sends: reference is the dispatch's bigint column.
+	raw := `{"type":"dispatch","dispatch_id":91,"session_id":7,"runner_id":3,"kind":"work_goal","purpose":"code",
+	"reference":148,"payload":"collie work_goal #148 in collie-agent","project":"collies","codebase":"collie-agent",
+	"mcp_url":"https://collies.sh/p/collies/mcp","ack_deadline":"2026-11-25T10:00:30Z"}`
+	var d Dispatch
+	if err := json.Unmarshal([]byte(raw), &d); err != nil {
+		t.Fatalf("decoding collie's message: %v", err)
+	}
+	if d.Reference != "148" || d.DispatchID != 91 || d.SessionID != 7 {
+		t.Errorf("dispatch = %+v", d)
+	}
+	var s Dispatch
+	if err := json.Unmarshal([]byte(`{"type":"dispatch","dispatch_id":1,"reference":"212"}`), &s); err != nil || s.Reference != "212" {
+		t.Errorf("string reference: %+v, %v", s, err)
 	}
 }

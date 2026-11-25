@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -535,4 +536,39 @@ func (c cableRejecting) Run(ctx context.Context, onSubscribed func(), onDispatch
 	}))
 	defer srv.Close()
 	return (&cable.Client{Server: srv.URL, Token: "tok"}).Run(ctx, onSubscribed, onDispatch)
+}
+
+// revokingSessions is a session runner whose session endpoint answers 401 as soon as a session starts.
+type revokingSessions struct {
+	recSessions
+	onRevoked func(error)
+}
+
+func (s *revokingSessions) OnRevoked(f func(error)) { s.onRevoked = f }
+func (s *revokingSessions) Start(ctx context.Context, sess dispatch.Session, done func()) error {
+	_ = s.recSessions.Start(ctx, sess, done)
+	go s.onRevoked(fmt.Errorf("renewing the session token: %w", machine.ErrRevoked))
+	return nil
+}
+
+func TestA401OnASessionEndpointStopsTheRunner(t *testing.T) {
+	f := newFakeCollie(t)
+	r, _, _ := setup(t, f)
+	sess := &revokingSessions{}
+	r.Sessions = sess
+	done := make(chan error, 1)
+	go func() { done <- r.Loop(context.Background()) }()
+	waitFor(t, "the cable subscription", func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.subscribed > 0 })
+	f.offer(offerFor(1, 11)) // the dispatch channel is connected and well
+	select {
+	case err := <-done:
+		if !errors.Is(err, machine.ErrRevoked) {
+			t.Fatalf("Loop = %v, want ErrRevoked", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a 401 from a session endpoint did not stop the runner")
+	}
+	if st, _ := r.Profile.LoadState(); !st.Revoked {
+		t.Error("the state does not say the machine was revoked")
+	}
 }

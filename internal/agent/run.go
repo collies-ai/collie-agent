@@ -172,6 +172,15 @@ func (r *Runner) Loop(ctx context.Context) error {
 	}
 	r.dispatcher = &dispatch.Dispatcher{API: r.Remote, Sessions: sessions, Log: r.logger(), MaxConcurrency: r.maxConcurrency()}
 
+	// Sessions that keep files on disk sweep what a crash left behind before taking new work, and the runner waits
+	// for running sessions to be stopped and cleaned up before it returns.
+	if sw, ok := sessions.(interface{ Sweep(context.Context) }); ok {
+		sw.Sweep(ctx)
+	}
+	if w, ok := sessions.(interface{ Wait() }); ok {
+		defer w.Wait()
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	fatal := make(chan error, 1)
@@ -181,6 +190,10 @@ func (r *Runner) Loop(ctx context.Context) error {
 		default: // the first error wins
 		}
 		cancel()
+	}
+	// A 401 on a session endpoint (renewing a token, reporting an event) is a revocation like any other: stop it all.
+	if rv, ok := sessions.(interface{ OnRevoked(func(error)) }); ok {
+		rv.OnRevoked(r.stop)
 	}
 	var wg sync.WaitGroup
 	start := func(f func(context.Context) error) {
