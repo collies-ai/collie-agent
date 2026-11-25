@@ -111,30 +111,52 @@ func Within(folder string, roots []string) (string, error) {
 	if len(roots) == 0 {
 		return "", ErrNoRoots
 	}
+	real, err := resolveFolder(folder)
+	if err != nil {
+		return "", err
+	}
+	resolved := make([]string, 0, len(roots))
+	for _, root := range roots {
+		if r, err := evalSymlinks(filepath.Clean(root)); err == nil {
+			resolved = append(resolved, r)
+		}
+	}
+	if !inside(real, resolved) {
+		return "", fmt.Errorf("folder %q is outside the root folders", folder)
+	}
+	return real, nil
+}
+
+// evalSymlinks is filepath.EvalSymlinks; tests replace it to redirect a path between two checks.
+var evalSymlinks = filepath.EvalSymlinks
+
+// resolveFolder checks folder is an absolute path to an existing directory and returns it with symlinks resolved.
+func resolveFolder(folder string) (string, error) {
 	if strings.TrimSpace(folder) == "" {
 		return "", errors.New("the binding has no folder")
 	}
 	if !filepath.IsAbs(folder) {
 		return "", fmt.Errorf("folder %q is not an absolute path", folder)
 	}
-	real, err := filepath.EvalSymlinks(filepath.Clean(folder))
+	real, err := evalSymlinks(filepath.Clean(folder))
 	if err != nil {
 		return "", fmt.Errorf("folder %q does not exist on this machine", folder)
 	}
 	if info, err := os.Stat(real); err != nil || !info.IsDir() {
 		return "", fmt.Errorf("folder %q is not a directory", folder)
 	}
-	for _, root := range roots {
-		r, err := filepath.EvalSymlinks(filepath.Clean(root))
-		if err != nil {
-			continue
-		}
+	return real, nil
+}
+
+// inside reports whether the resolved path real is one of the resolved roots or below one. It resolves nothing.
+func inside(real string, resolvedRoots []string) bool {
+	for _, r := range resolvedRoots {
 		rel, err := filepath.Rel(r, real)
 		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
-			return real, nil
+			return true
 		}
 	}
-	return "", fmt.Errorf("folder %q is outside the root folders", folder)
+	return false
 }
 
 func copyMap(m map[string]string) map[string]string {
@@ -158,7 +180,7 @@ type Root struct {
 func PinRoots(roots []string) []Root {
 	out := make([]Root, 0, len(roots))
 	for _, r := range roots {
-		if res, err := filepath.EvalSymlinks(filepath.Clean(r)); err == nil {
+		if res, err := evalSymlinks(filepath.Clean(r)); err == nil {
 			out = append(out, Root{Path: r, Resolved: res})
 		}
 	}
@@ -171,7 +193,7 @@ func WithinPinned(folder string, roots []Root) (string, error) {
 	var still []string
 	redirected := false
 	for _, r := range roots {
-		res, err := filepath.EvalSymlinks(filepath.Clean(r.Path))
+		res, err := evalSymlinks(filepath.Clean(r.Path))
 		if err != nil || res != r.Resolved {
 			redirected = true
 			continue
@@ -184,5 +206,14 @@ func WithinPinned(folder string, roots []Root) (string, error) {
 		}
 		return "", ErrNoRoots
 	}
-	return Within(folder, still)
+	real, err := resolveFolder(folder)
+	if err != nil {
+		return "", err
+	}
+	// Compare against the targets pinned at sync, never against the roots resolved again: a redirect after the
+	// check above cannot move the boundary.
+	if !inside(real, still) {
+		return "", fmt.Errorf("folder %q is outside the root folders", folder)
+	}
+	return real, nil
 }

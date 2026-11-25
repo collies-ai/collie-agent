@@ -129,3 +129,32 @@ func TestPinnedFolderMustStillBeInsideRoots(t *testing.T) {
 		t.Error("a pin moved the binding outside the root folders")
 	}
 }
+
+func TestARootRedirectedDuringTheCheckDoesNotMoveTheBoundary(t *testing.T) {
+	root := realDir(t)
+	outside := realDir(t)
+	escaped := filepath.Join(outside, "collie")
+	_ = os.MkdirAll(escaped, 0o755)
+	pinned := PinRoots([]string{root})
+
+	// The binding folder already resolves outside (e.g. swapped earlier); the root itself is redirected right after
+	// its redirect check, so a second resolution of the root would land in the outside tree.
+	orig := evalSymlinks
+	defer func() { evalSymlinks = orig }()
+	rootCalls := 0
+	evalSymlinks = func(p string) (string, error) {
+		if p == root {
+			rootCalls++
+			if rootCalls > 1 {
+				return outside, nil
+			}
+		}
+		return orig(p)
+	}
+	if got, err := WithinPinned(escaped, pinned); err == nil {
+		t.Fatalf("WithinPinned accepted %s after the root was redirected mid-check", got)
+	}
+	if rootCalls != 1 {
+		t.Errorf("the root was resolved %d times during one check, want 1", rootCalls)
+	}
+}
