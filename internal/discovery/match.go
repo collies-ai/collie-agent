@@ -125,14 +125,20 @@ func dedupe(repos []Repo) []Repo {
 	return out
 }
 
-// Inventory flattens the matches into the inventory sent to collie: every clone of each codebase, the chosen one
-// first.
+// Inventory turns the matches into the inventory sent to collie: one entry per codebase, with the chosen clone and
+// the others as its alternatives, in rank order.
 func Inventory(matches []CodebaseMatch) []machine.InventoryRepo {
 	var out []machine.InventoryRepo
 	for _, m := range matches {
-		for _, c := range m.Candidates {
-			out = append(out, machine.InventoryRepo{CodebaseID: m.CodebaseID, Path: c.Repo.Path})
+		if len(m.Candidates) == 0 {
+			continue
 		}
+		c := m.Chosen()
+		inv := machine.InventoryRepo{CodebaseID: m.CodebaseID, Path: c.Repo.Path, Source: c.Repo.Source, Remote: c.Remote}
+		for _, alt := range m.Candidates[1:] {
+			inv.Alternatives = append(inv.Alternatives, machine.InventoryClone{Path: alt.Repo.Path, Source: alt.Repo.Source, Remote: alt.Remote})
+		}
+		out = append(out, inv)
 	}
 	return out
 }

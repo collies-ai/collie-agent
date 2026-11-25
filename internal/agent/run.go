@@ -12,6 +12,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -34,6 +35,13 @@ const MaxBackoff = 5 * time.Minute
 
 // InventoryInterval is how often the repos are scanned and reported again.
 const InventoryInterval = 10 * time.Minute
+
+// Inventory retries after a failed report: from InventoryRetryMin, doubling up to InventoryRetryMax, so a rescan collie
+// asked for is not lost to one transient error until the next InventoryInterval.
+const (
+	InventoryRetryMin = 5 * time.Second
+	InventoryRetryMax = 2 * time.Minute
+)
 
 // MaxCableBackoff caps the wait between cable reconnects; the long-poll runs meanwhile.
 const MaxCableBackoff = time.Minute
@@ -60,7 +68,7 @@ type Remote interface {
 
 // Cable is the push channel (internal/cable.Client).
 type Cable interface {
-	Run(ctx context.Context, onSubscribed func(), onDispatch func(machine.Dispatch)) error
+	Run(ctx context.Context, onSubscribed func(), onDispatch func(machine.Dispatch), onCodebasesChanged func(version string)) error
 }
 
 // Runner is `collie-agent run` for one profile.
@@ -99,6 +107,65 @@ type Runner struct {
 	exact   []string
 	// resync says the last bindings sync failed after the exact folders changed: the next heartbeat or scan retries it.
 	resync atomic.Bool
+
+	// rescan asks the inventory loop to look for repos now (buffer 1: a burst of signals is one rescan).
+	rescan chan struct{}
+	// codebasesVersion is the last codebases_version seen from collie, over the cable or the heartbeat.
+	cbMu             sync.Mutex
+	codebasesVersion string
+	// inventoried says a report reached collie: a first codebases_version seen after it may hide a change made in
+	// between, so it asks for a rescan.
+	inventoried atomic.Bool
+}
+
+// signalRescan asks the inventory loop for a rescan without blocking; one already pending covers this one too.
+func (r *Runner) signalRescan() {
+	if r.rescan == nil {
+		return
+	}
+	select {
+	case r.rescan <- struct{}{}:
+	default:
+	}
+}
+
+// codebasesChanged records a codebases_version from collie and asks for a rescan when it is news. Over the cable the
+// event itself is news unless its version is not newer than one already seen; in a heartbeat only a newer version is
+// (the first one is covered by the scan at start). A heartbeat answered before a cable event can carry the older
+// version: it is not a change.
+func (r *Runner) codebasesChanged(version string, fromCable bool) {
+	r.cbMu.Lock()
+	prev := r.codebasesVersion
+	news := version != "" && newerVersion(version, prev)
+	if news {
+		r.codebasesVersion = version
+	}
+	r.cbMu.Unlock()
+	switch {
+	case fromCable && (version == "" || news):
+		r.logger().Print("collie says the codebases changed: looking for repos again")
+		r.signalRescan()
+	case !fromCable && news && prev != "":
+		r.logger().Print("the codebases version changed: looking for repos again")
+		r.signalRescan()
+	case !fromCable && news && r.inventoried.Load():
+		// The first version seen came after a report: a change made between the two would be absorbed silently.
+		r.signalRescan()
+	}
+}
+
+// newerVersion tells whether v comes after prev: by number when both are integers (collie's counter), otherwise
+// when they differ.
+func newerVersion(v, prev string) bool {
+	if prev == "" {
+		return true
+	}
+	a, errA := strconv.ParseInt(v, 10, 64)
+	b, errB := strconv.ParseInt(prev, 10, 64)
+	if errA == nil && errB == nil {
+		return a > b
+	}
+	return v != prev
 }
 
 func (r *Runner) sleep(ctx context.Context, d time.Duration) error {
@@ -182,6 +249,7 @@ func (r *Runner) Loop(ctx context.Context) error {
 	if sessions == nil {
 		sessions = dispatch.Unsupported{}
 	}
+	r.rescan = make(chan struct{}, 1)
 	r.dispatcher = &dispatch.Dispatcher{API: r.Remote, Sessions: sessions, Log: r.logger(), MaxConcurrency: r.maxConcurrency()}
 
 	// Sessions that keep files on disk sweep what a crash left behind before taking new work, and the runner waits
@@ -296,6 +364,7 @@ func (r *Runner) heartbeatLoop(ctx context.Context, bound chan struct{}) error {
 				st.LastError = ""
 				st.Running = hb.Running
 			})
+			r.codebasesChanged(resp.CodebasesVersion, false)
 			if r.Remote == nil {
 				markBound()
 			} else if resp.BindingsVersion != synced || synced == "" || r.resync.Load() {
@@ -398,10 +467,12 @@ func (r *Runner) syncBindings(ctx context.Context) error {
 	return nil
 }
 
-// inventoryLoop scans the root folders and reports the repos that match a codebase, now and every
-// InventoryInterval.
+// inventoryLoop looks for repos and reports the ones that match a codebase: now, every InventoryInterval, and right
+// away when collie says the codebases changed (a rescan signal).
 func (r *Runner) inventoryLoop(ctx context.Context) error {
+	retry := time.Duration(0)
 	for {
+		wait := InventoryInterval
 		if err := r.reportInventory(ctx); err != nil {
 			if errors.Is(err, machine.ErrRevoked) {
 				return err
@@ -409,12 +480,35 @@ func (r *Runner) inventoryLoop(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			r.logger().Printf("reporting repos: %v", err)
+			// The refresh stays pending: retry soon, backing off, instead of waiting for the next interval.
+			retry = min(max(retry*2, InventoryRetryMin), InventoryRetryMax)
+			wait = retry
+			r.logger().Printf("reporting repos (retrying in %s): %v", wait, err)
 			r.noteError(err)
+		} else {
+			retry = 0
+			r.inventoried.Store(true)
 		}
-		if err := r.sleep(ctx, InventoryInterval); err != nil {
+		if err := r.waitInventory(ctx, wait); err != nil {
 			return nil
 		}
+	}
+}
+
+// waitInventory waits d (through the injectable sleep) or a rescan signal, whichever comes first. It returns an error
+// only when ctx is done.
+func (r *Runner) waitInventory(ctx context.Context, d time.Duration) error {
+	sleepCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.sleep(sleepCtx, d) }()
+	select {
+	case <-r.rescan:
+		cancel()
+		<-done
+		return ctx.Err()
+	case <-done:
+		return ctx.Err()
 	}
 }
 
@@ -475,7 +569,7 @@ func (r *Runner) connectionLoop(ctx context.Context) error {
 						r.stop(err)
 					}
 				}()
-			})
+			}, func(version string) { r.codebasesChanged(version, true) })
 			stopCable()
 			if ctx.Err() != nil {
 				return nil

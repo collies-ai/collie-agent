@@ -35,9 +35,20 @@ type Heartbeat struct {
 	RootsCount int `json:"roots_count"`
 }
 
-// HeartbeatResponse is collie's answer: the bindings version, so the agent knows when to fetch its bindings again.
+// HeartbeatResponse is collie's answer: the bindings version, so the agent knows when to fetch its bindings again,
+// and the codebases version, so it knows when to look for repos again ("" when collie sends none).
 type HeartbeatResponse struct {
-	BindingsVersion string
+	BindingsVersion  string
+	CodebasesVersion string
+}
+
+// VersionString turns a version as collie sends it (a number, a string or null) into a string, "" for none.
+func VersionString(raw json.RawMessage) string {
+	v := strings.Trim(string(raw), `"`)
+	if v == "null" {
+		return ""
+	}
+	return v
 }
 
 // Client calls the machine API.
@@ -72,16 +83,13 @@ func (c *Client) Heartbeat(ctx context.Context, hb Heartbeat) (*HeartbeatRespons
 		hb.Running = []string{}
 	}
 	var raw struct {
-		BindingsVersion json.RawMessage `json:"bindings_version"`
+		BindingsVersion  json.RawMessage `json:"bindings_version"`
+		CodebasesVersion json.RawMessage `json:"codebases_version"`
 	}
 	if err := c.do(ctx, http.MethodPost, "/machine/v1/heartbeat", hb, &raw); err != nil {
 		return nil, err
 	}
-	v := strings.Trim(string(raw.BindingsVersion), `"`)
-	if v == "null" {
-		v = ""
-	}
-	return &HeartbeatResponse{BindingsVersion: v}, nil
+	return &HeartbeatResponse{BindingsVersion: VersionString(raw.BindingsVersion), CodebasesVersion: VersionString(raw.CodebasesVersion)}, nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, in, out any) error {

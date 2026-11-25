@@ -41,16 +41,19 @@ type fakeCollie struct {
 	codebases   []machine.Codebase
 	revokeAfter int // heartbeats before answering 401 (0: never)
 
-	mu           sync.Mutex
-	offers       []machine.Dispatch
-	acks         []ackRec
-	inventory    [][]machine.InventoryRepo
-	heartbeats   []machine.Heartbeat
-	rawHBs       []map[string]json.RawMessage // each heartbeat body as sent, to check which keys are present
-	bindingsV    int
-	bindingsGets int
-	polls        int
-	subscribed   int
+	mu            sync.Mutex
+	offers        []machine.Dispatch
+	acks          []ackRec
+	inventory     [][]machine.InventoryRepo
+	heartbeats    []machine.Heartbeat
+	rawHBs        []map[string]json.RawMessage // each heartbeat body as sent, to check which keys are present
+	bindingsV     int
+	codebasesV    int // sent in heartbeats when > 0
+	codebaseGets  int
+	failCodebases int // answer the next GETs of codebases with a 503
+	bindingsGets  int
+	polls         int
+	subscribed    int
 }
 
 func newFakeCollie(t *testing.T) *fakeCollie {
@@ -96,14 +99,29 @@ func (f *fakeCollie) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.heartbeats = append(f.heartbeats, hb)
 		f.rawHBs = append(f.rawHBs, raw)
-		n, v := len(f.heartbeats), f.bindingsV
+		n, v, cv := len(f.heartbeats), f.bindingsV, f.codebasesV
 		f.mu.Unlock()
 		if f.revokeAfter > 0 && n > f.revokeAfter {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"bindings_version": v})
+		resp := map[string]any{"bindings_version": v}
+		if cv > 0 {
+			resp["codebases_version"] = cv
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	case r.Method == http.MethodGet && r.URL.Path == "/machine/v1/codebases":
+		f.mu.Lock()
+		f.codebaseGets++
+		fail := f.failCodebases > 0
+		if fail {
+			f.failCodebases--
+		}
+		f.mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(f.codebases)
 	case r.Method == http.MethodPut && r.URL.Path == "/machine/v1/inventory":
 		var body struct {
@@ -476,7 +494,7 @@ func fmtSscan(s string, id *int64) (int, error) {
 // dropCable delivers one offer and then drops the connection right away, before the ack comes back.
 type dropCable struct{ offered sync.Once }
 
-func (c *dropCable) Run(ctx context.Context, onSubscribed func(), onDispatch func(machine.Dispatch)) error {
+func (c *dropCable) Run(ctx context.Context, onSubscribed func(), onDispatch func(machine.Dispatch), _ func(string)) error {
 	onSubscribed()
 	c.offered.Do(func() { onDispatch(offerFor(1, 11)) })
 	return errors.New("socket closed")
@@ -555,7 +573,7 @@ func TestACable401StopsTheRunnerWithoutPolling(t *testing.T) {
 // cableRejecting runs the real cable client against a server that refuses the token on the cable only.
 type cableRejecting struct{ mode string }
 
-func (c cableRejecting) Run(ctx context.Context, onSubscribed func(), onDispatch func(machine.Dispatch)) error {
+func (c cableRejecting) Run(ctx context.Context, onSubscribed func(), onDispatch func(machine.Dispatch), _ func(string)) error {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if c.mode == "refused at the upgrade" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -570,7 +588,7 @@ func (c cableRejecting) Run(ctx context.Context, onSubscribed func(), onDispatch
 		_, _, _ = conn.Read(r.Context())
 	}))
 	defer srv.Close()
-	return (&cable.Client{Server: srv.URL, Token: "tok"}).Run(ctx, onSubscribed, onDispatch)
+	return (&cable.Client{Server: srv.URL, Token: "tok"}).Run(ctx, onSubscribed, onDispatch, nil)
 }
 
 // revokingSessions is a session runner whose session endpoint answers 401 as soon as a session starts.

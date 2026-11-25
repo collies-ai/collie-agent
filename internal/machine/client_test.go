@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -54,6 +56,45 @@ func TestDispatchDecodesCollieMessage(t *testing.T) {
 	var s Dispatch
 	if err := json.Unmarshal([]byte(`{"type":"dispatch","dispatch_id":1,"reference":"212"}`), &s); err != nil || s.Reference != "212" {
 		t.Errorf("string reference: %+v, %v", s, err)
+	}
+}
+
+func TestInventoryJSONShape(t *testing.T) {
+	var body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "tok", "test")
+	err := c.PutInventory(context.Background(), []InventoryRepo{
+		{CodebaseID: 1, Path: "/code/collie", Source: "claude", Remote: "origin", Alternatives: []InventoryClone{
+			{Path: "/code/fork", Source: "root", Remote: "upstream"},
+		}},
+		{CodebaseID: 2, Path: "/code/agent"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"repos":[{"codebase_id":1,"path":"/code/collie","source":"claude","remote":"origin","alternatives":[{"path":"/code/fork","source":"root","remote":"upstream"}]},{"codebase_id":2,"path":"/code/agent"}]}`
+	if strings.TrimSpace(body) != want {
+		t.Errorf("inventory body =\n%s\nwant\n%s", body, want)
+	}
+}
+
+func TestHeartbeatReadsCodebasesVersion(t *testing.T) {
+	for resp, want := range map[string]string{
+		`{"bindings_version": 3, "codebases_version": 12}`:   "12",
+		`{"bindings_version": 3, "codebases_version": null}`: "",
+		`{"bindings_version": 3}`:                            "",
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(resp)) }))
+		got, err := NewClient(srv.URL, "tok", "test").Heartbeat(context.Background(), Heartbeat{})
+		srv.Close()
+		if err != nil || got.CodebasesVersion != want || got.BindingsVersion != "3" {
+			t.Errorf("%s: %+v, %v", resp, got, err)
+		}
 	}
 }
 
