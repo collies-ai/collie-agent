@@ -92,10 +92,14 @@ func (d *Systemd) Install(s Spec) error {
 	return nil
 }
 
-// Uninstall stops and disables the unit, deletes it and reloads systemd. With no unit file there is nothing of ours
-// to stop. If stopping fails the file is kept, so the CLI never says it removed a service that still runs.
+// Uninstall stops and disables the unit, deletes it and reloads systemd. If stopping fails the file is kept, so the
+// CLI never says it removed a service that still runs. With the file already gone, systemd may still have the unit
+// loaded and running: it is stopped, and only a unit systemd confirms it does not know counts as already stopped.
 func (d *Systemd) Uninstall() error {
 	if _, err := os.Stat(d.Path()); errors.Is(err, os.ErrNotExist) {
+		if out, err := d.Run("systemctl", "--user", "stop", d.Name()); err != nil && !systemdNotLoaded(out, err) {
+			return fmt.Errorf("systemctl --user stop %s: %v: %s", d.Name(), err, out)
+		}
 		return nil
 	}
 	if out, err := d.Run("systemctl", "--user", "disable", "--now", d.Name()); err != nil {
@@ -108,6 +112,17 @@ func (d *Systemd) Uninstall() error {
 		return fmt.Errorf("systemctl --user daemon-reload: %v: %s", err, out)
 	}
 	return nil
+}
+
+// systemdNotLoadedExit is systemctl's exit status for an unknown unit (LSB "program is not installed").
+const systemdNotLoadedExit = 5
+
+// systemdNotLoaded reports whether systemctl failed because the unit is not loaded, and nothing else.
+func systemdNotLoaded(out string, err error) bool {
+	if exitCode(err) == systemdNotLoadedExit {
+		return true
+	}
+	return strings.Contains(out, "not loaded") || strings.Contains(out, "not found")
 }
 
 // Status asks systemctl is-active about the unit.

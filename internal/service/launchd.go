@@ -124,15 +124,30 @@ func (l *Launchd) Install(s Spec) error {
 // bootout failure is returned before the plist is touched, so the CLI never says it removed an agent that still runs.
 func (l *Launchd) Uninstall() error {
 	target := l.domain() + "/" + l.Name()
-	if _, err := l.Run("launchctl", "print", target); err == nil {
-		if out, err := l.Run("launchctl", "bootout", target); err != nil {
-			return fmt.Errorf("launchctl bootout %s: %v: %s", target, err, out)
+	if out, err := l.Run("launchctl", "print", target); err != nil {
+		// Only a job launchd confirms it does not know is already stopped. Any other failure (permissions, the
+		// service manager) leaves its state unknown: keep the plist and say so.
+		if !launchdNotFound(out, err) {
+			return fmt.Errorf("launchctl print %s: %v: %s", target, err, out)
 		}
+	} else if out, err := l.Run("launchctl", "bootout", target); err != nil && !launchdNotFound(out, err) {
+		return fmt.Errorf("launchctl bootout %s: %v: %s", target, err, out)
 	}
 	if err := os.Remove(l.Path()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
+}
+
+// launchdNotFoundExit is launchctl's exit status for an unknown service (ESRCH as reported by launchctl: 113).
+const launchdNotFoundExit = 113
+
+// launchdNotFound reports whether launchctl failed because the job is not loaded, and nothing else.
+func launchdNotFound(out string, err error) bool {
+	if exitCode(err) == launchdNotFoundExit {
+		return true
+	}
+	return strings.Contains(out, "Could not find service") || strings.Contains(out, "No such process")
 }
 
 // Status asks launchctl print about the label.

@@ -200,14 +200,13 @@ func (c *Client) Poll(ctx context.Context, da *DeviceAuthorization) (*Result, er
 	}
 }
 
-// backOff doubles the interval after a failed request, up to maxInterval. It starts from the interval in force, so
-// earlier slow_down increases are kept.
+// backOff doubles the interval after a failed request, up to maxInterval. It never lowers the interval in force:
+// one the server set above the cap, or slow_down increases past it, stay as they are.
 func backOff(d time.Duration) time.Duration {
-	d *= 2
-	if d > maxInterval {
-		return maxInterval
+	if d >= maxInterval {
+		return d
 	}
-	return d
+	return min(d*2, maxInterval)
 }
 
 // ValidateVerificationURI checks a URL collie sent for the person to open: an absolute https URL (http only on a

@@ -268,9 +268,32 @@ func TestPollBacksOffAfterTimeouts(t *testing.T) {
 	assertWaits(t, waits, 5, 10, 20)
 }
 
-func TestBackOffIsCapped(t *testing.T) {
-	if got := backOff(45 * time.Second); got != maxInterval {
-		t.Errorf("backOff(45s) = %s", got)
+func TestBackOffIsCappedButNeverLowersTheInterval(t *testing.T) {
+	cases := map[time.Duration]time.Duration{
+		5 * time.Second:  10 * time.Second,
+		45 * time.Second: maxInterval,
+		60 * time.Second: 60 * time.Second,
+		65 * time.Second: 65 * time.Second, // a slow_down past the cap stays
+		90 * time.Second: 90 * time.Second, // a server interval above the cap stays
+	}
+	for in, want := range cases {
+		if got := backOff(in); got != want {
+			t.Errorf("backOff(%s) = %s, want %s", in, got, want)
+		}
+	}
+}
+
+func TestPollKeepsAServerIntervalAboveTheCap(t *testing.T) {
+	f := &fakeCollie{interval: 90, expiresIn: 900, tokenAnswers: []answer{
+		{503, map[string]string{}},
+		slowDown(),
+		{502, map[string]string{}},
+		{200, map[string]any{"machine_id": 1, "machine_token": "t"}},
+	}}
+	if _, err, waits := run(t, f); err != nil {
+		t.Fatal(err)
+	} else {
+		assertWaits(t, waits, 90, 90, 95, 95)
 	}
 }
 

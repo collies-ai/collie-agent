@@ -98,6 +98,15 @@ func LaunchdLabel(p config.Profile) string { return "sh.collies." + config.AppNa
 // SystemdUnit is the systemd unit of a profile: collie-agent.service, or collie-agent-<profile>.service.
 func SystemdUnit(p config.Profile) string { return config.AppName + p.Suffix() + ".service" }
 
+// exitCode is the exit status of a failed command, or -1 when err is not an exit status.
+func exitCode(err error) int {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
+}
+
 func writeFile(path, contents string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
