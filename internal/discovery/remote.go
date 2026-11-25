@@ -3,6 +3,7 @@ package discovery
 import (
 	"bufio"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -73,65 +74,92 @@ func RepoFullName(remote string) string {
 	return name
 }
 
-// hostResolver tells whether a remote's host is github.com, resolving ssh Host aliases.
+// hostResolver tells whether a remote's host is github.com, applying ~/.ssh/config to ssh remotes.
 type hostResolver struct {
-	aliases map[string]string // lowercase Host alias -> lowercase HostName
+	blocks []sshBlock
 }
 
-// newHostResolver reads the Host/HostName pairs of the ssh config at SSHConfigPath. A missing file means no aliases.
+// sshBlock is a Host block of an ssh client config: its patterns and the HostName it sets ("" when none).
+type sshBlock struct {
+	patterns []string
+	hostName string
+}
+
+// newHostResolver reads the Host/HostName pairs of the ssh config at SSHConfigPath. A missing file means none.
 func newHostResolver() *hostResolver {
-	return &hostResolver{aliases: readSSHAliases(SSHConfigPath())}
+	return &hostResolver{blocks: readSSHConfig(SSHConfigPath())}
 }
 
-// GitHubRepo returns the remote's "owner/name" when it is a github.com repo (directly, or through an ssh Host alias
-// whose HostName is github.com), and "" otherwise.
+// GitHubRepo returns the remote's "owner/name" when it is a github.com repo, and "" otherwise. For an ssh remote the
+// host is first resolved as ssh would (the HostName of the first matching Host block), so an alias pointing at
+// github.com counts and a "Host github.com" pointing elsewhere does not.
 func (h *hostResolver) GitHubRepo(remote string) string {
 	host, name, ssh, ok := ParseRemote(remote)
 	if !ok {
 		return ""
 	}
-	if githubHosts[host] {
-		return name
+	if ssh && h != nil {
+		host = h.hostName(host)
 	}
-	if ssh && h != nil && githubHosts[h.aliases[host]] {
+	if githubHosts[host] {
 		return name
 	}
 	return ""
 }
 
-// readSSHAliases parses only the Host and HostName keywords of an ssh client config: for each exact (non-wildcard)
-// Host name, the first HostName given in its block. Match blocks and Include are ignored.
-func readSSHAliases(path string) map[string]string {
-	out := map[string]string{}
-	if path == "" {
-		return out
+// hostName is the host ssh connects to for host: the HostName of the first Host block that matches it and sets one
+// (%h standing for host), or host itself.
+func (h *hostResolver) hostName(host string) string {
+	for _, b := range h.blocks {
+		if b.hostName != "" && hostMatches(host, b.patterns) {
+			return strings.ToLower(strings.ReplaceAll(b.hostName, "%h", host))
+		}
 	}
-	f, err := os.Open(path)
+	return host
+}
+
+// hostMatches applies ssh's Host matching: any pattern (with * and ?) matches, and no negated (!) pattern does.
+func hostMatches(host string, patterns []string) bool {
+	matched := false
+	for _, p := range patterns {
+		neg := strings.HasPrefix(p, "!")
+		ok, err := path.Match(strings.TrimPrefix(p, "!"), host)
+		if err != nil || !ok {
+			continue
+		}
+		if neg {
+			return false
+		}
+		matched = true
+	}
+	return matched
+}
+
+// readSSHConfig parses only the Host and HostName keywords of an ssh client config, in file order: each Host block's
+// patterns (lowercase) and its first HostName. Match blocks and Include are ignored.
+func readSSHConfig(file string) []sshBlock {
+	if file == "" {
+		return nil
+	}
+	f, err := os.Open(file)
 	if err != nil {
-		return out
+		return nil
 	}
 	defer f.Close()
-	var current []string // hosts of the block being read; nil inside a Match block
+	var out []sshBlock
+	cur := -1 // index of the Host block being read; -1 before the first or inside a Match block
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		key, value := sshKeyword(sc.Text())
 		switch key {
 		case "host":
-			current = nil
-			for _, h := range strings.Fields(value) {
-				if strings.ContainsAny(h, "*?!") {
-					continue
-				}
-				current = append(current, strings.ToLower(h))
-			}
+			out = append(out, sshBlock{patterns: strings.Fields(strings.ToLower(value))})
+			cur = len(out) - 1
 		case "match":
-			current = nil
+			cur = -1
 		case "hostname":
-			hn := strings.ToLower(strings.Trim(value, `"`))
-			for _, h := range current {
-				if _, set := out[h]; !set {
-					out[h] = hn
-				}
+			if cur >= 0 && out[cur].hostName == "" {
+				out[cur].hostName = strings.Trim(value, `"`)
 			}
 		}
 	}

@@ -33,9 +33,9 @@ func (m CodebaseMatch) Chosen() Candidate { return m.Candidates[0] }
 // codebases (the same repo in two projects) is a candidate of each. Repos appearing twice (same Path) count once,
 // keeping the latest LastUsed.
 //
-// Several clones of one codebase are ranked: a clone matched through origin before one matched through another
-// remote, a main checkout before a worktree, the most recently used first, then the one on its default branch; the
-// path breaks ties. Codebases come out in the order given, those with no clone left out.
+// Several clones of one codebase are ranked: a main checkout before a worktree, the most recently used first, then the
+// one on its default branch, then one matched through origin before one matched through another remote; the path
+// breaks ties. Codebases come out in the order given, those with no clone left out.
 func Match(repos []Repo, codebases []machine.Codebase) []CodebaseMatch {
 	hosts := newHostResolver()
 	repos = dedupe(repos)
@@ -77,9 +77,6 @@ func Match(repos []Repo, codebases []machine.Codebase) []CodebaseMatch {
 
 // better tells whether clone a ranks before clone b.
 func better(a, b Candidate) bool {
-	if a.ViaOtherRemote() != b.ViaOtherRemote() {
-		return !a.ViaOtherRemote()
-	}
 	if a.Repo.Worktree != b.Repo.Worktree {
 		return !a.Repo.Worktree
 	}
@@ -88,6 +85,9 @@ func better(a, b Candidate) bool {
 	}
 	if da, db := a.Repo.onDefaultBranch(a.Remote), b.Repo.onDefaultBranch(b.Remote); da != db {
 		return da
+	}
+	if a.ViaOtherRemote() != b.ViaOtherRemote() {
+		return !a.ViaOtherRemote()
 	}
 	return a.Repo.Path < b.Repo.Path
 }
