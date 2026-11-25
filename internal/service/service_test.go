@@ -223,10 +223,16 @@ func TestSystemdUnit(t *testing.T) {
 		f := filepath.Join(dir, "collie-agent.service")
 		_ = os.WriteFile(f, []byte(u), 0o644)
 		// System mode: --user needs a user runtime directory that CI containers lack. The syntax is the same, and
-		// systemd-analyze exits 0 on bad settings it ignores, so any output is a failure.
+		// systemd-analyze exits 0 on bad settings it ignores, so any line about our file is a failure. Lines about
+		// the host's own units (e.g. deprecated options in /usr/lib/systemd) are not ours.
 		out, err := exec.Command(analyze, "verify", f).CombinedOutput()
-		if err != nil || len(strings.TrimSpace(string(out))) > 0 {
+		if err != nil {
 			t.Errorf("systemd-analyze verify: %v: %s", err, out)
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.Contains(line, f) {
+				t.Errorf("systemd-analyze verify: %s", line)
+			}
 		}
 	}
 }
