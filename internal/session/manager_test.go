@@ -76,7 +76,8 @@ func (f *fakeAPI) snapshot() ([]string, []int) {
 }
 
 // fakeCLI is a shell script standing in for an agent CLI. It records what it got into $FAKE_OUT/<name>/. As claude it
-// insists on a terminal, asks the trust question, touches its hooks' files and shows the Remote Control link as a
+// insists on a terminal, asks the trust question (as Claude Code 2.1 does: "No, exit" selected, spaces drawn as cursor
+// moves, and Enter alone exits; FAKE_TRUST=old asks it as older versions did, "Yes, proceed" selected), touches its hooks' files and shows the Remote Control link as a
 // terminal hyperlink; with FAKE_IDLE it then goes idle and waits to be told to /exit. As codex it prints --json events
 // with usage.
 const fakeCLI = `#!/bin/sh
@@ -97,8 +98,20 @@ if [ "$name" = claude ]; then
     if [ "$prev" = "--settings" ]; then sdir=$(dirname "$a"); fi
     prev="$a"
   done
-  echo "Do you trust the files in this folder?"
-  read -r answer
+  if [ "$FAKE_TRUST" = old ]; then
+    printf '│ Do you trust the files in this folder? │\n│ ❯ 1. Yes, proceed │\n│   2. No, exit │\n'
+    printf '│ Enter to confirm · Esc to exit │\n'
+    read -r answer
+    if [ -n "$answer" ]; then echo "refused: $answer" > "$out/trusted"; exit 7; fi
+  else
+    printf ' Quick\033[1Csafety\033[1Ccheck:\033[1CIs\033[1Cthis\033[1Ca\033[1Cproject\033[1Cyou\033[1Ccreated\033[1Cor\033[1Cone\033[1Cyou\033[1Ctrust?\033[1C(Like\033[1Cyour\r\n'
+    printf ' own code, a well-known open source project, or work from your team).\r\n\r\n'
+    printf ' \033[1m❯\033[1CNo,\033[1Cexit\033[0m\r\n'
+    printf '   Yes,\033[1CI\033[1Ctrust\033[1Cthis\033[1Cfolder\r\n\r\n'
+    printf ' Enter\033[1Cto\033[1Cconfirm\033[1C·\033[1CEsc\033[1Cto\033[1Ccancel\r\n'
+    read -r answer
+    if [ "$answer" != "$(printf '\033[B')" ]; then echo "refused: $answer" > "$out/trusted"; exit 7; fi
+  fi
   echo trusted > "$out/trusted"
   touch "$sdir/activity"
   printf 'Remote Control \033]8;;https://claude.ai/code/session_01TESTabc-_9\033\\/rc active\033]8;;\033\\\n'
@@ -168,7 +181,9 @@ func env(t *testing.T) (*Manager, *fakeAPI, string, string) {
 	gitRun(t, repo, "push", "-q", "origin", "main")
 	gitRun(t, repo, "remote", "set-head", "origin", "main")
 	api := &fakeAPI{}
-	m := &Manager{API: api, Dir: filepath.Join(base, "sessions"), MaxConcurrency: 2, KillGrace: 200 * time.Millisecond, RetryWait: time.Millisecond}
+	m := &Manager{API: api, Dir: filepath.Join(base, "sessions"), MaxConcurrency: 2, KillGrace: 200 * time.Millisecond, RetryWait: time.Millisecond,
+		// The fake reads whole lines: no need to wait for it to draw, and the idle tests' timeouts are short.
+		AnswerSettle: 10 * time.Millisecond, AnswerKeyGap: 10 * time.Millisecond}
 	return m, api, repo, out
 }
 
@@ -216,7 +231,7 @@ func TestClaudeSessionRunsInItsWorktreeAndCleansUp(t *testing.T) {
 	m, api, repo, out := env(t)
 	run(t, m, session(42, "claude", repo, "auto"))
 
-	wt := filepath.Join(m.Dir, "42", "worktree")
+	wt := WorktreePath(repo, 42)
 	if got := read(t, filepath.Join(out, "claude", "pwd")); got != wt {
 		t.Errorf("ran in %s, want the session worktree %s", got, wt)
 	}
@@ -310,7 +325,7 @@ func TestCodexSessionNeverGoesThroughClaude(t *testing.T) {
 		t.Error("claude was invoked for a codex session")
 	}
 	args := strings.Join(strings.Split(read(t, filepath.Join(out, "codex", "args")), "\n"), " ")
-	for _, want := range []string{"exec", "--sandbox danger-full-access", `mcp_servers.collie.url="https://collie.test/p/collies/mcp"`, `mcp_servers.collie.bearer_token_env_var="COLLIE_SESSION_TOKEN"`, "--cd " + filepath.Join(m.Dir, "7", "worktree")} {
+	for _, want := range []string{"exec", "--sandbox danger-full-access", `mcp_servers.collie.url="https://collie.test/p/collies/mcp"`, `mcp_servers.collie.bearer_token_env_var="COLLIE_SESSION_TOKEN"`, "--cd " + WorktreePath(repo, 7)} {
 		if !strings.Contains(args, want) {
 			t.Errorf("codex args lack %q: %s", want, args)
 		}
@@ -459,12 +474,12 @@ func TestStaleWorktreesAreCleanedAtStartup(t *testing.T) {
 	m, _, repo, _ := env(t)
 	// What a kill -9 leaves: a session directory with a registered worktree and its branch.
 	stale := filepath.Join(m.Dir, "77")
-	if err := addWorktree(context.Background(), repo, filepath.Join(stale, "worktree"), "collie/session-77"); err != nil {
+	if err := addWorktree(context.Background(), repo, stale, WorktreePath(repo, 77), "collie/session-77"); err != nil {
 		t.Fatal(err)
 	}
 	// And a directory with no metadata at all.
 	_ = os.MkdirAll(filepath.Join(m.Dir, "78"), 0o700)
-	if !strings.Contains(worktrees(t, repo), filepath.Join(stale, "worktree")) {
+	if !strings.Contains(worktrees(t, repo), WorktreePath(repo, 77)) {
 		t.Fatal("setup: no worktree")
 	}
 	m.Sweep(context.Background())
@@ -474,7 +489,7 @@ func TestStaleWorktreesAreCleanedAtStartup(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(m.Dir, "78")); !os.IsNotExist(err) {
 		t.Error("the directory without metadata is still there")
 	}
-	if strings.Contains(worktrees(t, repo), filepath.Join(stale, "worktree")) {
+	if strings.Contains(worktrees(t, repo), WorktreePath(repo, 77)) {
 		t.Errorf("worktree still registered:\n%s", worktrees(t, repo))
 	}
 	if out, _ := exec.Command("git", "-C", repo, "branch", "--list", "collie/session-77").Output(); len(strings.TrimSpace(string(out))) > 0 {
@@ -611,7 +626,7 @@ func TestNoDefaultBranchFailsClearly(t *testing.T) {
 	if _, finished := api.snapshot(); len(finished) != 1 || finished[0] != -1 {
 		t.Errorf("finished = %v", finished)
 	}
-	if err := addWorktree(context.Background(), repo, filepath.Join(t.TempDir(), "wt"), "collie/x"); err == nil || !strings.Contains(err.Error(), "default branch") {
+	if err := addWorktree(context.Background(), repo, t.TempDir(), WorktreePath(repo, 1), "collie/x"); err == nil || !strings.Contains(err.Error(), "default branch") {
 		t.Errorf("addWorktree = %v, want a clear default-branch error", err)
 	}
 }
@@ -716,7 +731,7 @@ func TestASlowCollieDoesNotHoldUpTheAgent(t *testing.T) {
 func TestAnIdleClaudeSessionIsEnded(t *testing.T) {
 	m, api, repo, out := env(t)
 	t.Setenv("FAKE_IDLE", "1")
-	m.IdleTimeout = 200 * time.Millisecond
+	m.IdleTimeout = time.Second // longer than the fake takes to draw its trust dialog
 	m.IdlePoll = 20 * time.Millisecond
 	run(t, m, session(71, "claude", repo, "auto"))
 	if got := read(t, filepath.Join(out, "claude", "typed")); got != "/exit" {
@@ -730,7 +745,7 @@ func TestAnIdleClaudeSessionIsEnded(t *testing.T) {
 func TestAWorkingClaudeSessionIsNotEnded(t *testing.T) {
 	m, api, repo, _ := env(t)
 	t.Setenv("FAKE_SLEEP", "1") // active (the activity file is newer than any idle one) the whole time
-	m.IdleTimeout = 100 * time.Millisecond
+	m.IdleTimeout = time.Second // longer than the fake takes to draw its trust dialog
 	m.IdlePoll = 20 * time.Millisecond
 	run(t, m, session(72, "claude", repo, "auto"))
 	if _, finished := api.snapshot(); len(finished) != 1 || finished[0] != 0 {
@@ -772,7 +787,7 @@ func TestATrustLineAfterStartupGetsNoInput(t *testing.T) {
 	m, _, repo, out := env(t)
 	t.Setenv("FAKE_IDLE", "1")
 	t.Setenv("FAKE_LATE_TRUST", "1")
-	m.IdleTimeout = 200 * time.Millisecond
+	m.IdleTimeout = time.Second // longer than the fake takes to draw its trust dialog
 	m.IdlePoll = 20 * time.Millisecond
 	run(t, m, session(81, "claude", repo, "auto"))
 	if got := read(t, filepath.Join(out, "claude", "typed")); got != "/exit" {
@@ -781,13 +796,133 @@ func TestATrustLineAfterStartupGetsNoInput(t *testing.T) {
 }
 
 func TestOnlyTheTrustQuestionIsAnswered(t *testing.T) {
-	for _, line := range []string{"1. Yes, proceed", "Do you want to proceed?", "trust this folder", "Bash command: rm -rf x — Yes, proceed"} {
+	for _, line := range []string{"1. Yes, proceed", "Do you want to proceed?", "trust this folder", "Yes, I trust this folder", "Bash command: rm -rf x — Yes, proceed"} {
 		if claudeTrust.MatchString(line) {
 			t.Errorf("%q is taken for the trust dialog", line)
 		}
 	}
-	if !claudeTrust.MatchString("│ Do you trust the files in this folder? │") {
-		t.Error("the trust question is not recognized")
+	for _, line := range []string{
+		"│ Do you trust the files in this folder? │",
+		" Quick safety check: Is this a project you created or one you trust? (Like your",
+		"Quicksafetycheck:Isthisaprojectyoucreatedoroneyoutrust?(Likeyour",
+	} {
+		if !claudeTrust.MatchString(line) {
+			t.Errorf("the trust question %q is not recognized", line)
+		}
+	}
+}
+
+func TestTheTrustDialogIsAnsweredYes(t *testing.T) {
+	cases := []struct {
+		name  string
+		lines []string
+		keys  []string
+		done  bool
+	}{
+		{"2.1: No selected above Yes", []string{" Quick safety check: Is this a project you created or one you trust? (Like your", " own code...).", "", " ❯ No, exit", "   Yes, I trust this folder", "", " Enter to confirm · Esc to cancel"}, []string{keyDown, keyEnter}, true},
+		{"older: Yes selected", []string{"│ Do you trust the files in this folder? │", "│ ❯ 1. Yes, proceed │", "│   2. No, exit │", "│ Enter to confirm · Esc to exit │"}, []string{keyEnter}, true},
+		{"No selected below Yes", []string{"Is this a project you created or one you trust?", "  1. Yes, I trust this folder", "  2. Something else, maybe", "❯ 3. No, exit", "Enter to confirm"}, []string{keyUp, keyEnter}, true},
+		{"compacted by a terminal without spaces", []string{"Isthisaprojectyoucreatedoroneyoutrust?", "❯No,exit", "Yes,Itrustthisfolder", "Entertoconfirm·Esctocancel"}, []string{keyDown, keyEnter}, true},
+		{"footer not drawn yet", []string{"Is this a project you created or one you trust?", "❯ No, exit"}, nil, false},
+		{"no selection marker: left to a person", []string{"Is this a project you created or one you trust?", "No, exit", "Yes, I trust this folder", "Enter to confirm"}, nil, true},
+		{"no Yes option: left to a person", []string{"Is this a project you created or one you trust?", "❯ No, exit", "Enter to confirm"}, nil, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			keys, done := claudeTrustKeys(c.lines)
+			if done != c.done || strings.Join(keys, "|") != strings.Join(c.keys, "|") {
+				t.Errorf("got %q, %v; want %q, %v", keys, done, c.keys, c.done)
+			}
+		})
+	}
+	long := []string{"Is this a project you created or one you trust?"}
+	for range 45 {
+		long = append(long, "something else")
+	}
+	if keys, done := claudeTrustKeys(long); !done || keys != nil {
+		t.Errorf("a dialog with no footer in 40 lines got %q, %v", keys, done)
+	}
+}
+
+func TestTheOlderTrustDialogIsAnsweredToo(t *testing.T) {
+	m, _, repo, out := env(t)
+	t.Setenv("FAKE_TRUST", "old")
+	run(t, m, session(84, "claude", repo, "auto"))
+	if got := read(t, filepath.Join(out, "claude", "trusted")); got != "trusted" {
+		t.Errorf("the older trust dialog got %q", got)
+	}
+}
+
+func TestStripEscapesKeepsTheSpacesCursorMovesDraw(t *testing.T) {
+	if got := stripEscapes("\x1b[1mYes,\x1b[1CI\x1b[3Ctrust\x1b[Cit\x1b[0m"); got != "Yes, I   trust it" {
+		t.Errorf("stripEscapes = %q", got)
+	}
+}
+
+func TestSessionWorktreesLiveInTheRepoOutOfItsStatus(t *testing.T) {
+	m, _, repo, out := env(t)
+	t.Setenv("FAKE_IDLE", "1")
+	m.IdleTimeout = time.Second
+	m.IdlePoll = 20 * time.Millisecond
+	done := make(chan struct{})
+	if err := m.Start(context.Background(), session(85, "claude", repo, "auto"), func() { close(done) }); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "the agent to start", func() bool { _, err := os.Stat(filepath.Join(out, "claude", "trusted")); return err == nil })
+	wt := WorktreePath(repo, 85)
+	if want := filepath.Join(repo, ".claude", "worktrees", "collie-session-85"); wt != want {
+		t.Fatalf("WorktreePath = %s, want %s", wt, want)
+	}
+	if got := read(t, filepath.Join(out, "claude", "pwd")); got != wt {
+		t.Errorf("ran in %s, want %s", got, wt)
+	}
+	if st := gitRun(t, repo, "status", "--porcelain"); st != "" {
+		t.Errorf("the session worktree shows in the repo's status: %q", st)
+	}
+	<-done
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Error("the worktree is still there")
+	}
+	if strings.Count(read(t, filepath.Join(repo, ".git", "info", "exclude")), "/.claude/worktrees/") != 1 {
+		t.Error("the worktrees folder is not excluded exactly once")
+	}
+	// A second session does not add it again.
+	run(t, m, session(86, "claude", repo, "auto"))
+	if strings.Count(read(t, filepath.Join(repo, ".git", "info", "exclude")), "/.claude/worktrees/") != 1 {
+		t.Error("the worktrees folder was excluded twice")
+	}
+}
+
+// Sessions started by a version that kept the worktree in the session directory are still swept.
+func TestALegacySessionWorktreeIsSwept(t *testing.T) {
+	m, _, repo, _ := env(t)
+	stale := filepath.Join(m.Dir, "79")
+	_ = os.MkdirAll(stale, 0o700)
+	gitRun(t, repo, "worktree", "add", "-q", "-b", "collie/session-79", filepath.Join(stale, "worktree"), "main")
+	if err := os.WriteFile(filepath.Join(stale, metaFile), []byte(`{"repo":"`+repo+`","branch":"collie/session-79"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m.Sweep(context.Background())
+	if strings.Contains(worktrees(t, repo), "session-79") || gitRun(t, repo, "branch", "--list", "collie/session-79") != "" {
+		t.Errorf("the legacy worktree was not cleaned up:\n%s", worktrees(t, repo))
+	}
+}
+
+// Cleanup removes only a session worktree, whatever the metadata says.
+func TestCleanupLeavesAForeignWorktreeAlone(t *testing.T) {
+	m, _, repo, _ := env(t)
+	other := filepath.Join(filepath.Dir(repo), "other")
+	gitRun(t, repo, "worktree", "add", "-q", "-b", "mine", other, "main")
+	dir := filepath.Join(m.Dir, "80")
+	_ = os.MkdirAll(dir, 0o700)
+	if err := os.WriteFile(filepath.Join(dir, metaFile), []byte(`{"repo":"`+repo+`","worktree":"`+other+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeWorktree(context.Background(), dir); err == nil {
+		t.Error("no error for a worktree that is not a session's")
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("a foreign worktree was removed: %v", err)
 	}
 }
 
@@ -847,13 +982,13 @@ func TestABranchCreatedByAFailedWorktreeAddIsCleanedUp(t *testing.T) {
 func TestABranchIsOwnedFromItsCreation(t *testing.T) {
 	m, _, repo, _ := env(t)
 	sessionDir := filepath.Join(m.Dir, "91")
-	wt := filepath.Join(sessionDir, "worktree")
+	wt := WorktreePath(repo, 91)
 	// The checkout fails after the branch exists: the worktree path is taken by a file.
-	_ = os.MkdirAll(sessionDir, 0o700)
+	_ = os.MkdirAll(filepath.Dir(wt), 0o755)
 	if err := os.WriteFile(wt, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := addWorktree(context.Background(), repo, wt, "collie/session-91"); err == nil {
+	if err := addWorktree(context.Background(), repo, sessionDir, wt, "collie/session-91"); err == nil {
 		t.Fatal("addWorktree succeeded on a taken path")
 	}
 	if err := removeWorktree(context.Background(), sessionDir); err != nil {
@@ -862,7 +997,11 @@ func TestABranchIsOwnedFromItsCreation(t *testing.T) {
 	if b := gitRun(t, repo, "branch", "--list", "collie/session-91"); b != "" {
 		t.Errorf("the branch the session created is orphaned: %q", b)
 	}
-	if err := addWorktree(context.Background(), repo, wt, "collie/session-91"); err != nil {
+	if read(t, wt) != "x" {
+		t.Error("cleanup touched a file that is not a worktree")
+	}
+	_ = os.Remove(wt)
+	if err := addWorktree(context.Background(), repo, sessionDir, wt, "collie/session-91"); err != nil {
 		t.Errorf("the same session cannot run again: %v", err)
 	}
 }
@@ -878,7 +1017,7 @@ func TestAStopAfterTheBranchIsCreatedDoesNotOrphanIt(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sessionDir := filepath.Join(m.Dir, "92")
 	errc := make(chan error, 1)
-	go func() { errc <- addWorktree(ctx, repo, filepath.Join(sessionDir, "worktree"), "collie/session-92") }()
+	go func() { errc <- addWorktree(ctx, repo, sessionDir, WorktreePath(repo, 92), "collie/session-92") }()
 	waitUntil(t, "git to run the hook", func() bool { _, err := os.Stat(marker); return err == nil })
 	cancel()
 	if err := <-errc; err == nil {

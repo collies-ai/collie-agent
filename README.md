@@ -93,7 +93,9 @@ instead.
   reference. collie-agent accepts it when the binding is usable and there is room (machine-wide and per binding), and
   declines it with a reason otherwise (also when the binding's agent CLI is not installed).
 - **Sessions.** An accepted dispatch runs as one agent session:
-  - a git worktree of the bound repo in `<profile dir>/sessions/<id>/worktree`, on a new branch
+  - a git worktree of the bound repo in `<repo>/.claude/worktrees/collie-session-<id>` (where Claude Code's own
+    `--worktree` puts them; collie-agent adds `/.claude/worktrees/` to the repo's `.git/info/exclude` when it is not
+    ignored already, so it never shows in `git status`), on a new branch
     `collie/session-<id>` from the remote's default branch: `origin/HEAD`, or what `origin` says its HEAD is, and
     never the branch the repo happens to be on. When neither tells, the session fails with that reason (fix it with
     `git remote set-head origin --auto`). A `collie/session-<id>` branch that already exists is never reused or
@@ -107,14 +109,16 @@ instead.
     `full` → `bypassPermissions` / `danger-full-access` and `plan` → `plan` / `read-only` (anything else is `auto`);
   - **Claude Code** runs as an interactive session with Remote Control (`claude --remote-control <name> <prompt>`) in
     a pseudo-terminal, so it shows in claude.ai/code and the Claude app, where you can watch it, answer its
-    permission prompts or step in. collie-agent accepts the workspace trust dialog for the new worktree and reports
-    the session's claude.ai link to collie. Remote Control needs a claude.ai login (`claude auth login`), not an API
+    permission prompts or step in. Inside a repo you already trust in Claude Code the worktree asks nothing (trust
+    covers the folders below); otherwise collie-agent answers the workspace trust dialog "Yes, I trust this folder",
+    moving to that option rather than pressing Enter on the default (in Claude Code 2.1 it is "No, exit"), and leaves
+    a dialog it does not recognize to you. It reports the session's claude.ai link to collie. Remote Control needs a claude.ai login (`claude auth login`), not an API
     key; if `claude --remote-control` asks you to enable Remote Control, run it once yourself and accept. An
     interactive session does not exit on its own: hooks mark when it works and when it waits, and once it has waited
     15 minutes with nothing to do collie-agent types `/exit`. Claude reports its own usage to collie;
   - **Codex** runs headless (`codex exec --json`), and the token usage of its turns goes to collie with the session's
     end;
-  - output goes to `<profile dir>/sessions/<id>/agent.log`. When the agent exits (or the token dies, or the service
+  - output goes to `<profile dir>/sessions/<id>/agent.log`, next to the session's private files (MCP config, hooks). When the agent exits (or the token dies, or the service
     stops, which stops it) collie-agent reports the exit code and removes the worktree and the branch it created.
     Leftover worktrees from a crash are removed when `run` starts. Lifecycle reports never hold the agent up.
   - The agent runs as your OS user, with your access: bind only repos you trust collie's work in.

@@ -12,14 +12,60 @@ import (
 	"time"
 )
 
-// worktreeMeta is written next to each session's worktree, so a sweep after a crash knows which repo it belongs to.
-// Branch is set only once `git worktree add -b` created it: cleanup deletes only a branch this session created.
+// worktreeMeta is written in each session's directory, so a sweep after a crash knows which repo and worktree it
+// belongs to. Branch is set only once git created it: cleanup deletes only a branch this session created. Worktree is
+// empty in the metadata of versions that kept the worktree in the session directory (<session dir>/worktree).
 type worktreeMeta struct {
-	Repo   string `json:"repo"`
-	Branch string `json:"branch,omitempty"`
+	Repo     string `json:"repo"`
+	Worktree string `json:"worktree,omitempty"`
+	Branch   string `json:"branch,omitempty"`
 }
 
 const metaFile = "session.json"
+
+// worktreesDir is where session worktrees live inside the bound repo: the folder Claude Code's own --worktree uses.
+// Inside the repo, a session inherits what the agent CLI already knows about the repo: Claude Code's workspace trust
+// is per folder and covers the folders below it, so a repo the person trusted asks nothing of a session's worktree.
+const worktreesDir = ".claude/worktrees"
+
+// WorktreePath is where the session's worktree goes: <repo>/.claude/worktrees/collie-session-<id>.
+func WorktreePath(repo string, id int64) string {
+	return filepath.Join(repo, filepath.FromSlash(worktreesDir), fmt.Sprintf("collie-session-%d", id))
+}
+
+// ownedWorktree reports whether path is a place collie-agent puts a session worktree: a collie-session-* folder in the
+// repo's worktrees folder, or the old <session dir>/worktree. removeWorktree never touches anything else, whatever the
+// metadata says.
+func ownedWorktree(repo, sessionDir, path string) bool {
+	path = filepath.Clean(path)
+	if path == filepath.Join(sessionDir, "worktree") {
+		return true
+	}
+	return filepath.Dir(path) == filepath.Join(repo, filepath.FromSlash(worktreesDir)) &&
+		strings.HasPrefix(filepath.Base(path), "collie-session-")
+}
+
+// excludeWorktrees keeps the worktrees folder out of the repo's `git status` when its .gitignore does not already: it
+// adds it to the repo's local exclude file (.git/info/exclude), which is never committed. Best effort.
+func excludeWorktrees(ctx context.Context, repo string) {
+	if _, err := git(ctx, repo, "check-ignore", "-q", worktreesDir+"/collie-session-0"); err == nil {
+		return // already ignored
+	}
+	path, err := git(ctx, repo, "rev-parse", "--git-path", "info/exclude")
+	if err != nil {
+		return
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(repo, path)
+	}
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString("\n# collie-agent session worktrees\n/" + worktreesDir + "/\n")
+}
 
 // git runs git in dir and returns its trimmed output.
 func git(ctx context.Context, dir string, args ...string) (string, error) {
@@ -76,23 +122,24 @@ func remoteHead(out string) string {
 	return ""
 }
 
-// addWorktree creates dir as a worktree of repo on a new branch from the default branch, and records it so a sweep
-// can remove it if collie-agent dies. A branch that already exists is an error, never reused or deleted.
+// addWorktree creates wt as a worktree of repo on a new branch from the default branch, and records it in sessionDir
+// so a sweep can remove it if collie-agent dies. A branch that already exists is an error, never reused or deleted;
+// so is a taken path.
 //
 // The branch is created on its own first (`git branch` refuses one that exists, atomically) and recorded as the
 // session's right away, so cleanup deletes it whatever happens to the checkout after: a stop, a failing hook. That
 // step runs on its own short context, so a stop cannot leave a branch created but not recorded.
-func addWorktree(ctx context.Context, repo, dir, branch string) error {
-	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+func addWorktree(ctx context.Context, repo, sessionDir, wt, branch string) error {
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
 		return err
 	}
-	metaPath := filepath.Join(filepath.Dir(dir), metaFile)
+	metaPath := filepath.Join(sessionDir, metaFile)
 	write := func(m worktreeMeta) error {
 		b, _ := json.Marshal(m)
 		return os.WriteFile(metaPath, b, 0o600)
 	}
 	// The repo first, so a sweep can prune a half-made worktree.
-	if err := write(worktreeMeta{Repo: repo}); err != nil {
+	if err := write(worktreeMeta{Repo: repo, Worktree: wt}); err != nil {
 		return err
 	}
 	base, err := defaultBase(ctx, repo)
@@ -108,18 +155,19 @@ func addWorktree(ctx context.Context, repo, dir, branch string) error {
 		}
 		return err
 	}
-	if err := write(worktreeMeta{Repo: repo, Branch: branch}); err != nil {
+	if err := write(worktreeMeta{Repo: repo, Worktree: wt, Branch: branch}); err != nil {
 		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_, _ = git(dctx, repo, "branch", "-D", branch)
 		cancel()
 		return err
 	}
-	_, err = git(ctx, repo, "worktree", "add", dir, branch)
+	excludeWorktrees(ctx, repo)
+	_, err = git(ctx, repo, "worktree", "add", wt, branch)
 	return err
 }
 
-// removeWorktree removes the worktree and its local branch (whatever the agent pushed stays on the remote), and the
-// session's directory with it. It keeps going on errors and returns the first one.
+// removeWorktree removes the session's worktree and its local branch (whatever the agent pushed stays on the remote),
+// then the session's directory. It keeps going on errors and returns the first one.
 func removeWorktree(ctx context.Context, sessionDir string) error {
 	var first error
 	keep := func(err error) {
@@ -131,8 +179,13 @@ func removeWorktree(ctx context.Context, sessionDir string) error {
 	if err == nil {
 		var m worktreeMeta
 		if json.Unmarshal(b, &m) == nil && m.Repo != "" {
-			wt := filepath.Join(sessionDir, "worktree")
-			if _, statErr := os.Stat(wt); statErr == nil {
+			wt := m.Worktree
+			if wt == "" {
+				wt = filepath.Join(sessionDir, "worktree")
+			}
+			if !ownedWorktree(m.Repo, sessionDir, wt) {
+				keep(fmt.Errorf("%s: worktree %q is not a session worktree; left alone", metaFile, wt))
+			} else if _, statErr := os.Stat(wt); statErr == nil {
 				_, err := git(ctx, m.Repo, "worktree", "remove", "--force", wt)
 				keep(err)
 			}
