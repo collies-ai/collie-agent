@@ -30,6 +30,9 @@ type Heartbeat struct {
 	MaxConcurrency int      `json:"max_concurrency"`
 	Agents         []Agent  `json:"agents"`
 	Running        []string `json:"running"`
+	// RootsCount is how many root folders are configured. Always sent (no omitempty): 0 means "no roots", while
+	// collie reads a missing value (an older agent) as unknown.
+	RootsCount int `json:"roots_count"`
 }
 
 // HeartbeatResponse is collie's answer: the bindings version, so the agent knows when to fetch its bindings again.

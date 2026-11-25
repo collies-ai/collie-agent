@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -44,6 +46,7 @@ type fakeCollie struct {
 	acks         []ackRec
 	inventory    [][]machine.InventoryRepo
 	heartbeats   []machine.Heartbeat
+	rawHBs       []map[string]json.RawMessage // each heartbeat body as sent, to check which keys are present
 	bindingsV    int
 	bindingsGets int
 	polls        int
@@ -85,10 +88,14 @@ func (f *fakeCollie) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/cable":
 		f.serveCable(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/machine/v1/heartbeat":
+		body, _ := io.ReadAll(r.Body)
 		var hb machine.Heartbeat
-		_ = json.NewDecoder(r.Body).Decode(&hb)
+		_ = json.Unmarshal(body, &hb)
+		var raw map[string]json.RawMessage
+		_ = json.Unmarshal(body, &raw)
 		f.mu.Lock()
 		f.heartbeats = append(f.heartbeats, hb)
+		f.rawHBs = append(f.rawHBs, raw)
 		n, v := len(f.heartbeats), f.bindingsV
 		f.mu.Unlock()
 		if f.revokeAfter > 0 && n > f.revokeAfter {
@@ -352,6 +359,34 @@ func TestDispatchesOverTheCable(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Errorf("Loop = %v", err)
+	}
+}
+
+func TestHeartbeatSendsRootsCount(t *testing.T) {
+	for _, n := range []int{0, 1, 2} {
+		t.Run(fmt.Sprintf("%d roots", n), func(t *testing.T) {
+			f := newFakeCollie(t)
+			r, _, _ := setup(t, f)
+			roots := []string{}
+			for i := 0; i < n; i++ {
+				roots = append(roots, t.TempDir())
+			}
+			r.Settings.RootFolders = roots
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- r.Loop(ctx) }()
+			waitFor(t, "a heartbeat", func() bool { f.mu.Lock(); defer f.mu.Unlock(); return len(f.rawHBs) > 0 })
+			cancel()
+			<-done
+
+			f.mu.Lock()
+			raw := f.rawHBs[0]
+			f.mu.Unlock()
+			// Sent even when 0: collie reads a missing roots_count as "unknown" (an older agent), not as "no roots".
+			if got, ok := raw["roots_count"]; !ok || string(got) != strconv.Itoa(n) {
+				t.Errorf("roots_count = %s (present: %v), want %d", got, ok, n)
+			}
+		})
 	}
 }
 
