@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/collies-ai/collie-agent/internal/config"
 )
@@ -20,6 +21,8 @@ type Launchd struct {
 	UID     int
 	Run     Commander
 	Profile config.Profile
+	// Sleep waits between launchctl retries; nil means time.Sleep. Tests replace it.
+	Sleep func(time.Duration)
 }
 
 // Name is the launchd label.

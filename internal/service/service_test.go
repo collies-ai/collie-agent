@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/collies-ai/collie-agent/internal/config"
 )
@@ -34,11 +35,29 @@ type fakeRun struct {
 	fail    map[string]bool
 	// exits gives a failing command a real exit status (an *exec.ExitError), as launchctl and systemctl return.
 	exits map[string]int
+	// seq answers successive calls of a command line in order; the last step repeats. It wins over the maps above.
+	seq map[string][]step
+}
+
+// step is one scripted answer: code 0 succeeds, any other code fails with that exit status.
+type step struct {
+	out  string
+	code int
 }
 
 func (f *fakeRun) run(name string, args ...string) (string, error) {
 	line := strings.Join(append([]string{name}, args...), " ")
 	f.calls = append(f.calls, line)
+	if steps := f.seq[line]; len(steps) > 0 {
+		s := steps[0]
+		if len(steps) > 1 {
+			f.seq[line] = steps[1:]
+		}
+		if s.code != 0 {
+			return s.out, exitWith(s.code)
+		}
+		return s.out, nil
+	}
 	if code, ok := f.exits[line]; ok {
 		return f.answers[line], exitWith(code)
 	}
@@ -560,5 +579,128 @@ func TestLaunchdUninstallAcceptsExit113(t *testing.T) {
 	}
 	if _, err := os.Stat(l.Path()); !os.IsNotExist(err) {
 		t.Error("plist still there")
+	}
+}
+
+const (
+	launchdRunning  = "sh.collies.collie-agent = {\n\tactive count = 1\n\tstate = running\n}"
+	launchdNotKnown = "Bad request.\nCould not find service \"sh.collies.collie-agent\" in domain for user gui: 501"
+	launchdEIO      = "Bootstrap failed: 5: Input/output error\nTry re-running the command as root for richer errors."
+)
+
+// count returns how many recorded calls equal line.
+func count(calls []string, line string) int {
+	n := 0
+	for _, c := range calls {
+		if c == line {
+			n++
+		}
+	}
+	return n
+}
+
+// Re-installing over a running agent: launchd keeps the old job for a few seconds after bootout returns, and a
+// bootstrap in that window fails with EIO (exit 5). Install must wait for the job to go and retry the bootstrap, and
+// end with the agent loaded.
+func TestLaunchdInstallRetriesBootstrapAfterBootout(t *testing.T) {
+	p := profile(t, "")
+	target := "gui/501/sh.collies.collie-agent"
+	home := t.TempDir()
+	l := &Launchd{Home: home, UID: 501, Profile: p}
+	bootstrap := "launchctl bootstrap gui/501 " + l.Path()
+	f := &fakeRun{seq: map[string][]step{
+		// Still there right after bootout, then gone, then loaded again by the bootstrap.
+		"launchctl print " + target: {{launchdRunning, 0}, {launchdNotKnown, 113}, {launchdRunning, 0}},
+		bootstrap:                   {{launchdEIO, 5}, {"", 0}},
+	}}
+	var slept []time.Duration
+	l.Run, l.Sleep = f.run, func(d time.Duration) { slept = append(slept, d) }
+	if err := l.Install(spec(p)); err != nil {
+		t.Fatalf("install: %v\ncalls:\n%s", err, strings.Join(f.calls, "\n"))
+	}
+	if n := count(f.calls, bootstrap); n != 2 {
+		t.Errorf("bootstrap ran %d times, want 2\ncalls:\n%s", n, strings.Join(f.calls, "\n"))
+	}
+	if f.calls[0] != "launchctl bootout "+target {
+		t.Errorf("first call = %q, want the bootout", f.calls[0])
+	}
+	if f.calls[1] != "launchctl print "+target {
+		t.Errorf("second call = %q, want a print waiting for the bootout", f.calls[1])
+	}
+	if len(slept) == 0 {
+		t.Error("install never waited")
+	}
+	st, _ := l.Status()
+	if !st.Running || st.Detail != "running" {
+		t.Errorf("status = %+v", st)
+	}
+}
+
+// A bootstrap that keeps failing is retried a bounded number of times, and the error tells the user how to load the
+// agent by hand.
+func TestLaunchdInstallGivesUpAndSaysHowToLoad(t *testing.T) {
+	p := profile(t, "")
+	target := "gui/501/sh.collies.collie-agent"
+	l := &Launchd{Home: t.TempDir(), UID: 501, Profile: p}
+	bootstrap := "launchctl bootstrap gui/501 " + l.Path()
+	f := &fakeRun{seq: map[string][]step{
+		"launchctl print " + target: {{launchdNotKnown, 113}},
+		bootstrap:                   {{launchdEIO, 5}},
+	}}
+	var total time.Duration
+	l.Run, l.Sleep = f.run, func(d time.Duration) { total += d }
+	err := l.Install(spec(p))
+	if err == nil {
+		t.Fatal("install succeeded with a bootstrap that always fails")
+	}
+	for _, want := range []string{"Input/output error", bootstrap[len("launchctl "):]} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	if n := count(f.calls, bootstrap); n < 2 || n > 10 {
+		t.Errorf("bootstrap ran %d times", n)
+	}
+	if total > 30*time.Second {
+		t.Errorf("waited %v", total)
+	}
+}
+
+// Other bootstrap failures (a broken plist, permissions) are not retried.
+func TestLaunchdInstallDoesNotRetryOtherFailures(t *testing.T) {
+	p := profile(t, "")
+	l := &Launchd{Home: t.TempDir(), UID: 501, Profile: p}
+	bootstrap := "launchctl bootstrap gui/501 " + l.Path()
+	f := &fakeRun{seq: map[string][]step{
+		"launchctl print gui/501/sh.collies.collie-agent": {{launchdNotKnown, 113}},
+		bootstrap: {{"Bootstrap failed: 1: Operation not permitted", 1}},
+	}}
+	l.Run, l.Sleep = f.run, func(time.Duration) {}
+	if err := l.Install(spec(p)); err == nil || !strings.Contains(err.Error(), "Operation not permitted") {
+		t.Fatalf("err = %v", err)
+	}
+	if n := count(f.calls, bootstrap); n != 1 {
+		t.Errorf("bootstrap ran %d times, want 1", n)
+	}
+}
+
+// A job that never goes away does not hang install: it stops waiting and tries the bootstrap anyway.
+func TestLaunchdInstallStopsWaitingForAStuckBootout(t *testing.T) {
+	p := profile(t, "")
+	l := &Launchd{Home: t.TempDir(), UID: 501, Profile: p}
+	bootstrap := "launchctl bootstrap gui/501 " + l.Path()
+	f := &fakeRun{seq: map[string][]step{
+		"launchctl print gui/501/sh.collies.collie-agent": {{launchdRunning, 0}},
+	}}
+	var total time.Duration
+	l.Run, l.Sleep = f.run, func(d time.Duration) { total += d }
+	if err := l.Install(spec(p)); err != nil {
+		t.Fatal(err)
+	}
+	if count(f.calls, bootstrap) != 1 {
+		t.Errorf("calls:\n%s", strings.Join(f.calls, "\n"))
+	}
+	if total == 0 || total > 30*time.Second {
+		t.Errorf("waited %v", total)
 	}
 }
