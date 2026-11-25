@@ -213,17 +213,24 @@ func TestSkipped(t *testing.T) {
 	}
 }
 
-func TestCodexProjectHeader(t *testing.T) {
-	for line, want := range map[string]string{
-		`[projects."/Users/a/x"]`:          "/Users/a/x",
-		`[projects.'/Users/a/x y']`:        "/Users/a/x y",
-		`[ projects . "/Users/a/\"q\""  ]`: `/Users/a/"q"`,
-		`[projects]`:                       "",
-		`[mcp_servers."/x"]`:               "",
-		`[[projects."/x"]]`:                "",
+func TestTOMLKeyPath(t *testing.T) {
+	for in, want := range map[string][]string{
+		`projects."/Users/a/x"]`:           {"projects", "/Users/a/x"},
+		`projects.'/Users/a/x y']`:         {"projects", "/Users/a/x y"},
+		` "projects" . "/Users/a/\"q\"" ]`: {"projects", `/Users/a/"q"`},
+		`trust_level = "trusted"`:          {"trust_level"},
+		`"trust_level" = "trusted"`:        {"trust_level"},
+		`'trust_level'= "trusted"`:         {"trust_level"},
+		`"trust\u005flevel" = 1`:           {"trust_level"},
 	} {
-		if got := codexProjectHeader(line); got != want {
-			t.Errorf("codexProjectHeader(%s) = %q, want %q", line, got, want)
+		got, _, ok := tomlKeyPath(in)
+		if !ok || !reflect.DeepEqual(got, want) {
+			t.Errorf("tomlKeyPath(%s) = %q, %v; want %q", in, got, ok, want)
+		}
+	}
+	for _, bad := range []string{`= 1`, `"open = 1`, `'open = 1`, `a. = 1`} {
+		if got, _, ok := tomlKeyPath(bad); ok {
+			t.Errorf("tomlKeyPath(%s) = %q, want failure", bad, got)
 		}
 	}
 }
@@ -290,6 +297,29 @@ trust_level = "trusted"
 			t.Errorf("ambiguous trust %q trusted %v", dup, got)
 		}
 	}
+	// Quoted and bare spellings are the same key or table (TOML compares them decoded), and trust set another way is
+	// ambiguous too.
+	for _, dup := range []string{
+		`[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n" + `"trust_level" = "untrusted"` + "\n",
+		`[projects."` + good + `"]` + "\n" + `'trust_level' = "untrusted"` + "\n" + `trust_level = "trusted"` + "\n",
+		`[projects."` + good + `"]` + "\n" + `"trust\u005flevel" = "untrusted"` + "\n" + `trust_level = "trusted"` + "\n",
+		`[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n" + `["projects".'` + good + `']` + "\n" + `trust_level = "untrusted"` + "\n",
+		`projects."` + good + `".trust_level = "untrusted"` + "\n" + `[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n",
+		`[projects]` + "\n" + `"` + good + `" = { trust_level = "untrusted" }` + "\n" + `[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n",
+		`[projects."` + good + `".sub]` + "\n" + `x = 1` + "\n" + `[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n",
+		`[[projects]]` + "\n" + `x = 1` + "\n" + `[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n",
+	} {
+		write(dup)
+		if got := paths(); len(got) != 0 {
+			t.Errorf("ambiguous trust %q trusted %v", dup, got)
+		}
+	}
+	// The plain shape with quoted spellings still works.
+	write(`["projects".'` + good + `']` + "\n" + `"trust_level" = "trusted"` + "\n")
+	if got := paths(); !reflect.DeepEqual(got, []string{good}) {
+		t.Errorf("quoted spellings: %v", got)
+	}
+
 	// A trust value that is not a plain one-line string is not trusted.
 	write(`[projects."` + good + `"]` + "\n" + `trust_level = """trusted"""` + "\n")
 	if got := paths(); len(got) != 0 {
