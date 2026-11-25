@@ -1,0 +1,37 @@
+# Built by .github/workflows/release.yml when a v* tag is pushed.
+version: 2
+
+project_name: collie-agent
+
+builds:
+  - id: collie-agent
+    main: ./cmd/collie-agent
+    binary: collie-agent
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X github.com/collies-ai/collie-agent/internal/version.Version={{ .Tag }}
+
+archives:
+  - id: collie-agent
+    formats: [tar.gz]
+    # No version in the name, so install.sh can use releases/latest/download/<name>.
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+release:
+  extra_files:
+    - glob: ./install.sh
+
+changelog:
+  use: github
+  sort: asc
