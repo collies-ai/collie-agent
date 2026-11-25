@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -36,6 +37,10 @@ func newHarness(t *testing.T, goos string) *harness {
 		Stdout: h.out, Stderr: h.err, Getenv: os.Getenv, GOOS: goos, Home: h.home, UID: 501,
 		Commander: func(name string, args ...string) (string, error) {
 			h.commands = append(h.commands, strings.Join(append([]string{name}, args...), " "))
+			if name == "launchctl" && len(args) > 0 && args[0] == "print" {
+				// No agent is loaded: service install does not wait for one to go away.
+				return "Could not find service", errors.New("exit status 113")
+			}
 			return "", nil
 		},
 		Executable:  func() (string, error) { return "/usr/local/bin/collie-agent", nil },

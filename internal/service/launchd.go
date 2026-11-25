@@ -103,7 +103,20 @@ func str(b *bytes.Buffer, v string) {
 	b.WriteString("</string>\n")
 }
 
+// How long Install waits for launchd to let go of a booted-out job, and how often it looks.
+const (
+	launchdBootoutTimeout = 15 * time.Second
+	launchdBootoutPoll    = 250 * time.Millisecond
+)
+
+// launchdBootstrapBackoff are the waits between bootstrap attempts that fail with EIO.
+var launchdBootstrapBackoff = []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second, 4 * time.Second}
+
 // Install writes the plist and (re)loads it with launchctl bootstrap.
+//
+// bootout returns before launchd has finished tearing the old job down, and a bootstrap in that window fails with
+// "Bootstrap failed: 5: Input/output error". So Install waits until launchctl print no longer knows the label, then
+// bootstraps, retrying on EIO. If it still fails the error says how to load the agent by hand.
 func (l *Launchd) Install(s Spec) error {
 	plist, err := l.Render(s)
 	if err != nil {
@@ -117,10 +130,45 @@ func (l *Launchd) Install(s Spec) error {
 	}
 	// A previous version may be loaded: unload it first, ignoring "not loaded".
 	_, _ = l.Run("launchctl", "bootout", l.domain()+"/"+l.Name())
-	if out, err := l.Run("launchctl", "bootstrap", l.domain(), l.Path()); err != nil {
-		return fmt.Errorf("launchctl bootstrap: %v: %s", err, out)
+	l.waitUntilGone()
+	var out string
+	for attempt := 0; ; attempt++ {
+		out, err = l.Run("launchctl", "bootstrap", l.domain(), l.Path())
+		if err == nil {
+			return nil
+		}
+		if attempt >= len(launchdBootstrapBackoff) || !launchdBusy(out, err) {
+			break
+		}
+		l.sleep(launchdBootstrapBackoff[attempt])
 	}
-	return nil
+	return fmt.Errorf("launchctl bootstrap: %v: %s\nThe agent is not loaded. Load it with: launchctl bootstrap %s %s",
+		err, out, l.domain(), l.Path())
+}
+
+// waitUntilGone polls launchctl print until launchd no longer knows the label, for at most launchdBootoutTimeout.
+// Any other answer than "loaded" or "not found" ends the wait: the bootstrap that follows reports the real problem.
+func (l *Launchd) waitUntilGone() {
+	target := l.domain() + "/" + l.Name()
+	for waited := time.Duration(0); ; waited += launchdBootoutPoll {
+		if _, err := l.Run("launchctl", "print", target); err != nil || waited >= launchdBootoutTimeout {
+			return
+		}
+		l.sleep(launchdBootoutPoll)
+	}
+}
+
+// launchdBusy reports whether bootstrap failed with EIO, which launchd returns while the old job is still going away.
+func launchdBusy(out string, err error) bool {
+	return exitCode(err) == 5 || strings.Contains(out, "Input/output error")
+}
+
+func (l *Launchd) sleep(d time.Duration) {
+	if l.Sleep != nil {
+		l.Sleep(d)
+		return
+	}
+	time.Sleep(d)
 }
 
 // Uninstall unloads the agent and deletes the plist. A label launchd does not know is already stopped; any other

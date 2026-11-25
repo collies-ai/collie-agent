@@ -344,10 +344,12 @@ func TestRenderNeedsAnAbsoluteExecutable(t *testing.T) {
 func TestLaunchdInstallUninstallStatus(t *testing.T) {
 	p := profile(t, "work")
 	home := t.TempDir()
-	f := &fakeRun{answers: map[string]string{
-		"launchctl print gui/501/sh.collies.collie-agent-work": "sh.collies.collie-agent-work = {\n\tactive count = 1\n\tstate = running\n}",
+	running := "sh.collies.collie-agent-work = {\n\tactive count = 1\n\tstate = running\n}"
+	f := &fakeRun{seq: map[string][]step{
+		// Gone once the bootout finished, loaded after the bootstrap.
+		"launchctl print gui/501/sh.collies.collie-agent-work": {{"Could not find service", 113}, {running, 0}},
 	}}
-	l := &Launchd{Home: home, UID: 501, Run: f.run, Profile: p}
+	l := &Launchd{Home: home, UID: 501, Run: f.run, Profile: p, Sleep: func(time.Duration) {}}
 	if err := l.Install(spec(p)); err != nil {
 		t.Fatal(err)
 	}
@@ -356,6 +358,7 @@ func TestLaunchdInstallUninstallStatus(t *testing.T) {
 	}
 	want := []string{
 		"launchctl bootout gui/501/sh.collies.collie-agent-work",
+		"launchctl print gui/501/sh.collies.collie-agent-work",
 		"launchctl bootstrap gui/501 " + l.Path(),
 	}
 	if strings.Join(f.calls, "\n") != strings.Join(want, "\n") {
