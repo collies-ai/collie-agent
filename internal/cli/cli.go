@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -12,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -20,6 +22,7 @@ import (
 	"github.com/collies-ai/collie-agent/internal/browser"
 	"github.com/collies-ai/collie-agent/internal/cable"
 	"github.com/collies-ai/collie-agent/internal/config"
+	"github.com/collies-ai/collie-agent/internal/discovery"
 	"github.com/collies-ai/collie-agent/internal/machine"
 	"github.com/collies-ai/collie-agent/internal/pairing"
 	"github.com/collies-ai/collie-agent/internal/service"
@@ -40,7 +43,7 @@ const (
 const usage = `collie-agent connects this machine to collie, so collie can wake coding agents here.
 
 Usage:
-  collie-agent pair [--server URL] [--name NAME] [--no-browser] [--force]
+  collie-agent pair [--server URL] [--name NAME] [--no-browser] [--force] [--discover claude,codex|none]
   collie-agent unpair
   collie-agent service install|uninstall|status
   collie-agent roots add|remove <folder> | roots list
@@ -54,15 +57,18 @@ instance with its own pairing, config and service. The default is one instance p
 
 // App holds what the commands need from the outside world, so tests can replace it.
 type App struct {
+	Stdin          io.Reader
 	Stdout, Stderr io.Writer
-	Getenv         func(string) string
-	GOOS           string
-	Home           string
-	UID            int
-	Commander      service.Commander
-	Executable     func() (string, error)
-	OpenBrowser    func(string) error
-	Hostname       func() (string, error)
+	// IsTerminal reports whether Stdin is a terminal a person can answer questions on.
+	IsTerminal  func() bool
+	Getenv      func(string) string
+	GOOS        string
+	Home        string
+	UID         int
+	Commander   service.Commander
+	Executable  func() (string, error)
+	OpenBrowser func(string) error
+	Hostname    func() (string, error)
 	// Context is the base context of long-running commands; Main cancels it on SIGINT and SIGTERM.
 	Context context.Context
 	// PairingClient, when set, replaces the default HTTP client of the device flow (tests).
@@ -79,6 +85,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 	home, _ := os.UserHomeDir()
 	app := &App{
+		Stdin: os.Stdin, IsTerminal: stdinIsTerminal,
 		Stdout: stdout, Stderr: stderr, Getenv: os.Getenv, GOOS: runtime.GOOS, Home: home, UID: os.Getuid(),
 		Commander: service.ExecCommander, Executable: os.Executable, OpenBrowser: browser.Open, Hostname: os.Hostname,
 		Context: ctx,
@@ -185,8 +192,18 @@ func (a *App) pair(p config.Profile, args []string) int {
 	name := fs.String("name", "", "name of this machine in collie (default: the hostname)")
 	noBrowser := fs.Bool("no-browser", false, "do not open the browser, only print the URL")
 	force := fs.Bool("force", false, "pair again even if this profile is already paired")
+	discoverFlag := fs.String("discover", "", "where else to find repos: claude,codex (the folders they trust) or none; asked when not given")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
+	}
+	var discover []string
+	if *discoverFlag != "" {
+		d, err := config.ParseDiscover(*discoverFlag)
+		if err != nil {
+			fmt.Fprintln(a.Stderr, "collie-agent:", err)
+			return exitUsage
+		}
+		discover = d
 	}
 	existing, err := p.LoadCredentials()
 	if err != nil && !errors.Is(err, config.ErrNotPaired) {
@@ -251,6 +268,9 @@ func (a *App) pair(p config.Profile, args []string) int {
 		return a.fail(fmt.Errorf("paired, but could not save the credentials: %w", err))
 	}
 	fmt.Fprintf(a.Stdout, "Paired as machine #%s. Credentials saved to %s.\n", res.MachineID, p.CredentialsPath())
+	if err := a.askDiscover(p, discover); err != nil {
+		return a.fail(fmt.Errorf("paired, but could not save the discovery answer: %w", err))
+	}
 	next := "collie-agent service install"
 	if !p.IsDefault() {
 		next += " --profile " + p.Name
@@ -260,6 +280,46 @@ func (a *App) pair(p config.Profile, args []string) int {
 		fmt.Fprintln(a.Stdout, "If the service was already installed, run that command again so it picks up the new pairing.")
 	}
 	return exitOK
+}
+
+// askDiscover records in config.json whether repos are also found where Claude Code and Codex were trusted. The
+// --discover flag (flag non-nil) always sets it. Otherwise the person is asked once, on a terminal, and only when
+// config.json has no answer yet, so pair --force keeps an earlier one. Without a terminal nothing is written: only root
+// folders, as before.
+func (a *App) askDiscover(p config.Profile, flag []string) error {
+	s, err := p.LoadSettings()
+	if err != nil {
+		return err
+	}
+	answer := flag
+	if answer == nil {
+		if s.Discover != nil || a.IsTerminal == nil || !a.IsTerminal() || a.Stdin == nil {
+			return nil
+		}
+		fmt.Fprint(a.Stdout, "Use the repos you already opened with Claude Code or Codex? [Y/n] ")
+		line, err := bufio.NewReader(a.Stdin).ReadString('\n')
+		if err != nil && (err != io.EOF || strings.TrimSpace(line) == "") {
+			// No answer (end of input or a read error) is not consent: leave it unset.
+			fmt.Fprintln(a.Stdout, "\nNo answer: only repos under root folders will be found (pair --force --discover claude,codex turns discovery on).")
+			return nil
+		}
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "", "y", "yes":
+			answer = slices.Clone(config.DiscoverSources)
+		default:
+			answer = []string{}
+		}
+	}
+	s.Discover = &answer
+	if err := p.SaveSettings(s); err != nil {
+		return err
+	}
+	if len(answer) > 0 {
+		fmt.Fprintf(a.Stdout, "Repos trusted in %s will be found and allowed (\"discover\" in %s).\n", strings.Join(answer, " and "), p.SettingsPath())
+	} else {
+		fmt.Fprintf(a.Stdout, "Only repos under root folders will be found (collie-agent roots add <folder>).\n")
+	}
+	return nil
 }
 
 func (a *App) unpair(p config.Profile, args []string) int {
@@ -311,6 +371,7 @@ func (a *App) run(p config.Profile, args []string) int {
 		api = a.MachineAPI(creds.Server, creds.MachineToken)
 	}
 	r := &agent.Runner{Profile: p, MachineID: creds.MachineID, API: api, Settings: settings, Log: logger, Sleep: a.RunSleep}
+	r.Discover = func(roots, sources []string) []discovery.Repo { return discovery.Discover(a.Home, sources, roots) }
 	// The full machine API turns on discovery, bindings and dispatches; the cable is the push channel for them.
 	if remote, ok := api.(agent.Remote); ok {
 		r.Remote = remote
@@ -323,7 +384,7 @@ func (a *App) run(p config.Profile, args []string) int {
 		}
 		r.Sessions = &session.Manager{API: sapi, Dir: filepath.Join(p.Dir, "sessions"), Log: logger, MaxConcurrency: max, Setup: settings.SessionSetup}
 	}
-	logger.Printf("collie-agent %s running as machine #%s with %s (profile %q, %d root folders)", version.Version, creds.MachineID, creds.Server, p.Name, len(settings.RootFolders))
+	logger.Printf("collie-agent %s running as machine #%s with %s (profile %q, %d root folders, discovery %v)", version.Version, creds.MachineID, creds.Server, p.Name, len(settings.RootFolders), settings.DiscoverFrom())
 	if err := r.Loop(a.ctx()); err != nil {
 		if errors.Is(err, machine.ErrRevoked) {
 			return stopped
@@ -373,10 +434,20 @@ func (a *App) status(p config.Profile, args []string) int {
 	}
 	if settings, err := p.LoadSettings(); err != nil {
 		fmt.Fprintf(w, "Config:      unreadable: %v\n", err)
-	} else if len(settings.RootFolders) == 0 {
-		fmt.Fprintln(w, "Roots:       none (collie-agent roots add <folder>)")
 	} else {
-		fmt.Fprintf(w, "Roots:       %s\n", strings.Join(settings.RootFolders, ", "))
+		if len(settings.RootFolders) == 0 {
+			fmt.Fprintln(w, "Roots:       none (collie-agent roots add <folder>)")
+		} else {
+			fmt.Fprintf(w, "Roots:       %s\n", strings.Join(settings.RootFolders, ", "))
+		}
+		switch {
+		case settings.Discover == nil:
+			fmt.Fprintln(w, "Discovery:   off (not asked; pair --force --discover claude,codex turns it on)")
+		case len(*settings.Discover) == 0:
+			fmt.Fprintln(w, "Discovery:   off")
+		default:
+			fmt.Fprintf(w, "Discovery:   repos trusted in %s\n", strings.Join(*settings.Discover, ", "))
+		}
 	}
 	if st != nil && st.Repos > 0 {
 		fmt.Fprintf(w, "Repos:       %d matching a codebase\n", st.Repos)

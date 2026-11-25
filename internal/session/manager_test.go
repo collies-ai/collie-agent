@@ -448,7 +448,7 @@ func TestTheDispatcherCapsSessionsAtMaxConcurrency(t *testing.T) {
 	d := &dispatch.Dispatcher{API: acks, Sessions: m, MaxConcurrency: 2}
 	b := session(0, "claude", repo, "auto").Binding
 	b.MaxConcurrency = 5
-	d.SetBindings([]bindings.Binding{b}, []string{filepath.Dir(repo)})
+	d.SetBindings([]bindings.Binding{b}, bindings.Allowed{Roots: []string{filepath.Dir(repo)}})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() { cancel(); m.Wait() }()
 	for id := int64(1); id <= 4; id++ {

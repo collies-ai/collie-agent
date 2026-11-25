@@ -59,24 +59,33 @@ type Dispatcher struct {
 	// MaxConcurrency is the machine-wide limit of sessions at once.
 	MaxConcurrency int
 
-	mu          sync.Mutex
-	bindings    map[int64]bindings.Binding // by runner id
-	running     map[int64]slot             // session id → its slot
-	reserved    map[int64]slot             // offers being acked: session id → its slot
-	handled     map[int64]bool             // offer (session) ids already handled, so the cable and the long-poll don't ack twice
-	rootFolders []bindings.Root
+	mu       sync.Mutex
+	bindings map[int64]bindings.Binding // by runner id
+	running  map[int64]slot             // session id → its slot
+	reserved map[int64]slot             // offers being acked: session id → its slot
+	handled  map[int64]bool             // offer (session) ids already handled, so the cable and the long-poll don't ack twice
+	allowed  bindings.Pinned
 }
 
-// SetBindings replaces the bindings the dispatcher accepts offers for, and the root folders their folders must stay
+// SetBindings replaces the bindings the dispatcher accepts offers for, and the allowed folders their folders must stay
 // inside (checked again on every offer).
-func (d *Dispatcher) SetBindings(bs []bindings.Binding, roots []string) {
+func (d *Dispatcher) SetBindings(bs []bindings.Binding, allowed bindings.Allowed) {
 	m := make(map[int64]bindings.Binding, len(bs))
 	for _, b := range bs {
 		m[b.RunnerID] = b
 	}
 	d.mu.Lock()
 	d.bindings = m
-	d.rootFolders = bindings.PinRoots(roots)
+	d.allowed = bindings.PinRoots(allowed)
+	d.mu.Unlock()
+}
+
+// SetAllowed replaces only the allowed folders, keeping the bindings: a narrower boundary applies to the next offer
+// even before collie's bindings can be fetched again.
+func (d *Dispatcher) SetAllowed(allowed bindings.Allowed) {
+	pinned := bindings.PinRoots(allowed)
+	d.mu.Lock()
+	d.allowed = pinned
 	d.mu.Unlock()
 }
 
@@ -125,7 +134,7 @@ func (d *Dispatcher) Handle(ctx context.Context, m machine.Dispatch) error {
 	// The folder was checked when the bindings synced; check it again now, so a folder (or an ancestor) swapped for
 	// a symlink since then cannot send the session outside the root folders. The roots are pinned to where they
 	// resolved at sync: a redirected root no longer counts. The session gets the fresh path.
-	folder, err := bindings.WithinPinned(b.Folder, d.roots())
+	folder, err := bindings.WithinPinned(b.Folder, d.allowedFolders())
 	if err != nil {
 		d.release(key)
 		return d.decline(ctx, key, m, "binding refused by the machine: "+err.Error())
@@ -177,10 +186,10 @@ func (d *Dispatcher) decline(ctx context.Context, key int64, m machine.Dispatch,
 	}
 }
 
-func (d *Dispatcher) roots() []bindings.Root {
+func (d *Dispatcher) allowedFolders() bindings.Pinned {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.rootFolders
+	return d.allowed
 }
 
 // reserve checks an offer and, when it can be accepted, reserves a slot for it while it is acked. It returns a

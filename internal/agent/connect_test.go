@@ -266,7 +266,7 @@ func setup(t *testing.T, f *fakeCollie) (*Runner, *recSessions, string) {
 		Settings:   &config.Settings{RootFolders: []string{root}, MaxConcurrency: 3},
 		Sleep:      shortSleep,
 		FindAgents: func(context.Context) []machine.Agent { return []machine.Agent{{Name: "claude", Version: "2.1.0"}} },
-		ScanRepos:  discovery.ScanRepos,
+		Discover:   func(roots, _ []string) []discovery.Repo { return discovery.Discover("", nil, roots) },
 	}
 	return r, sess, repo
 }
@@ -605,5 +605,54 @@ func TestA401OnASessionEndpointStopsTheRunner(t *testing.T) {
 	}
 	if st, _ := r.Profile.LoadState(); !st.Revoked {
 		t.Error("the state does not say the machine was revoked")
+	}
+}
+
+func TestDiscoveredReposAreAllowedOnlyWithDiscover(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		f := newFakeCollie(t)
+		r, _, repo := setup(t, f)
+		emptyRoot := t.TempDir()
+		r.Settings = &config.Settings{RootFolders: []string{emptyRoot}}
+		if on {
+			r.Settings.Discover = &[]string{"claude"}
+		}
+		r.Discover = func(roots, sources []string) []discovery.Repo {
+			if len(sources) == 0 {
+				return nil
+			}
+			found, _ := discovery.ResolveRepo(repo)
+			found.Source = discovery.SourceClaude
+			return []discovery.Repo{found}
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- r.Loop(ctx) }()
+		waitFor(t, "the inventory", func() bool { f.mu.Lock(); defer f.mu.Unlock(); return len(f.inventory) > 0 })
+		var refused string
+		waitFor(t, "the bindings in the state", func() bool {
+			st, _ := r.Profile.LoadState()
+			for _, b := range st.Bindings {
+				if b.RunnerID == 11 {
+					refused = b.Refused
+					return !on || refused == ""
+				}
+			}
+			return false
+		})
+		cancel()
+		<-done
+		if on && refused != "" {
+			t.Errorf("discover on: the discovered repo was refused: %s", refused)
+		}
+		if !on && !strings.Contains(refused, "outside the root folders") {
+			t.Errorf("discover off: refused = %q", refused)
+		}
+		f.mu.Lock()
+		inv := f.inventory[0]
+		f.mu.Unlock()
+		if on != (len(inv) == 1) {
+			t.Errorf("discover %v: inventory = %+v", on, inv)
+		}
 	}
 }

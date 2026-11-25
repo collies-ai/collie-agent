@@ -11,7 +11,9 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -77,9 +79,10 @@ type Runner struct {
 	// Sleep waits d or until ctx is done; tests replace it.
 	Sleep func(ctx context.Context, d time.Duration) error
 	Now   func() time.Time
-	// FindAgents and ScanRepos are replaced by tests.
+	// FindAgents and Discover are replaced by tests. Discover finds the repos under the root folders and, for each of
+	// the sources the person allowed (config.json discover), the ones Claude Code or Codex trust.
 	FindAgents func(ctx context.Context) []machine.Agent
-	ScanRepos  func(roots []string) []discovery.Repo
+	Discover   func(roots, sources []string) []discovery.Repo
 
 	dispatcher *dispatch.Dispatcher
 	// stop ends the whole Loop with err (a revocation found anywhere, including a late ack after a reconnect).
@@ -87,6 +90,15 @@ type Runner struct {
 	stateMu sync.Mutex
 	state   *config.State
 	agents  []machine.Agent
+
+	// syncMu serializes bindings syncs: the heartbeat and a discovery that changed the exact folders both sync.
+	syncMu sync.Mutex
+	// exact are the repo folders discovery found through Claude Code, Codex or the fallback scan: allowed as binding
+	// folders (exactly, never their children) only while config.json has discover.
+	exactMu sync.Mutex
+	exact   []string
+	// resync says the last bindings sync failed after the exact folders changed: the next heartbeat or scan retries it.
+	resync atomic.Bool
 }
 
 func (r *Runner) sleep(ctx context.Context, d time.Duration) error {
@@ -207,8 +219,8 @@ func (r *Runner) Loop(ctx context.Context) error {
 	}
 
 	if r.Remote != nil {
-		if len(r.settings().RootFolders) == 0 {
-			r.logger().Print("no root folders configured: no repos are reported and every binding is refused (collie-agent roots add <folder>)")
+		if len(r.settings().RootFolders) == 0 && len(r.settings().DiscoverFrom()) == 0 {
+			r.logger().Print("no root folders configured and discovery is off: no repos are reported and every binding is refused (collie-agent roots add <folder>)")
 		}
 		r.agents = r.findAgents(ctx)
 	}
@@ -286,7 +298,7 @@ func (r *Runner) heartbeatLoop(ctx context.Context, bound chan struct{}) error {
 			})
 			if r.Remote == nil {
 				markBound()
-			} else if resp.BindingsVersion != synced || synced == "" {
+			} else if resp.BindingsVersion != synced || synced == "" || r.resync.Load() {
 				if err := r.syncBindings(ctx); err != nil {
 					if errors.Is(err, machine.ErrRevoked) || ctx.Err() != nil {
 						return ignoreCanceled(ctx, err)
@@ -325,14 +337,55 @@ func ignoreCanceled(ctx context.Context, err error) error {
 	return err
 }
 
+// allowed is where binding folders may be: inside the root folders, or exactly a discovered repo when discovery is on.
+func (r *Runner) allowed() bindings.Allowed {
+	a := bindings.Allowed{Roots: r.settings().RootFolders}
+	if len(r.settings().DiscoverFrom()) > 0 {
+		r.exactMu.Lock()
+		a.Exact = slices.Clone(r.exact)
+		r.exactMu.Unlock()
+	}
+	return a
+}
+
+// setExact records the exact folders of the latest discovery and reports whether they changed.
+func (r *Runner) setExact(repos []discovery.Repo) bool {
+	var exact []string
+	for _, repo := range repos {
+		if repo.Source != discovery.SourceRoot {
+			exact = append(exact, repo.Path)
+		}
+	}
+	slices.Sort(exact)
+	r.exactMu.Lock()
+	defer r.exactMu.Unlock()
+	if slices.Equal(exact, r.exact) {
+		return false
+	}
+	r.exact = exact
+	return true
+}
+
+// applyAllowed gives the dispatcher the current allowed folders, keeping its bindings. It holds syncMu so a sync in
+// flight cannot put back the folders it read before.
+func (r *Runner) applyAllowed() {
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+	r.dispatcher.SetAllowed(r.allowed())
+}
+
 // syncBindings fetches collie's bindings, applies the local config and hands them to the dispatcher.
 func (r *Runner) syncBindings(ctx context.Context) error {
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
 	server, err := r.Remote.Bindings(ctx)
 	if err != nil {
 		return err
 	}
-	resolved := bindings.Resolve(server, r.settings())
-	r.dispatcher.SetBindings(resolved, r.settings().RootFolders)
+	allowed := r.allowed() // read under syncMu: a discovery that changes it after this point syncs again
+	resolved := bindings.Resolve(server, r.settings(), allowed)
+	r.dispatcher.SetBindings(resolved, allowed)
+	r.resync.Store(false)
 	states := make([]config.BindingState, 0, len(resolved))
 	for _, b := range resolved {
 		if !b.Usable() {
@@ -366,15 +419,35 @@ func (r *Runner) inventoryLoop(ctx context.Context) error {
 }
 
 func (r *Runner) reportInventory(ctx context.Context) error {
+	discover := r.Discover
+	if discover == nil {
+		discover = func(roots, sources []string) []discovery.Repo {
+			home, _ := os.UserHomeDir()
+			return discovery.Discover(home, sources, roots)
+		}
+	}
+	repos := discover(r.settings().RootFolders, r.settings().DiscoverFrom())
+	// Discovered folders are allowed binding folders. When they change, the dispatcher's boundary changes right away
+	// (a repo no longer trusted is refused from the next offer, whatever collie answers), and the bindings are synced
+	// again so the ones refused for lack of a folder are checked again. A failed sync is retried by the next heartbeat
+	// or scan.
+	if changed := r.setExact(repos); len(r.settings().DiscoverFrom()) > 0 && r.dispatcher != nil && (changed || r.resync.Load()) {
+		if changed {
+			r.applyAllowed()
+		}
+		if err := r.syncBindings(ctx); err != nil {
+			r.resync.Store(true)
+			if errors.Is(err, machine.ErrRevoked) {
+				return err
+			}
+			r.logger().Printf("syncing bindings after discovery: %v", err)
+		}
+	}
 	codebases, err := r.Remote.Codebases(ctx)
 	if err != nil {
 		return err
 	}
-	scan := r.ScanRepos
-	if scan == nil {
-		scan = discovery.ScanRepos
-	}
-	inv := discovery.Inventory(discovery.Match(scan(r.settings().RootFolders), codebases))
+	inv := discovery.Inventory(discovery.Match(repos, codebases))
 	if err := r.Remote.PutInventory(ctx, inv); err != nil {
 		return err
 	}
