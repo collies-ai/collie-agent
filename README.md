@@ -111,7 +111,7 @@ instead.
 
     | Mode | Claude Code `--permission-mode` | Codex `--sandbox` |
     | --- | --- | --- |
-    | `auto` (default) | `auto`: Claude decides what needs you and works on its own otherwise (`acceptEdits` on a Claude Code without auto mode, read from `claude --help`) | `workspace-write` |
+    | `auto` (default) | `auto`: Claude decides what needs you and works on its own otherwise (`acceptEdits` on a Claude Code without auto mode, read from `claude --help`) | `workspace-write`, with the network on (tests that listen on localhost, `gh`) |
     | `full` | `bypassPermissions` | `danger-full-access` |
     | `plan` | `plan` | `read-only` |
 

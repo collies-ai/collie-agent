@@ -1143,3 +1143,22 @@ func TestASessionLeavesNoProcessBehind(t *testing.T) {
 	}
 	waitUntil(t, "the orphan to be stopped", func() bool { return syscall.Kill(pid, 0) != nil })
 }
+
+// workspace-write cuts the network unless told otherwise: a review could neither run tests that listen on localhost
+// nor reach GitHub with gh. Only auto needs it: full has no sandbox, plan stays read-only.
+func TestCodexGetsTheNetworkInsideItsWorkspaceSandbox(t *testing.T) {
+	const network = "-c sandbox_workspace_write.network_access=true"
+	for mode, want := range map[string]bool{"auto": true, "": true, "full": false, "plan": false} {
+		c, err := (Codex{}).Command(Launch{PermissionMode: mode, TokenEnv: TokenEnv, Prompt: "p"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		args := strings.Join(c.Args, " ")
+		if strings.Contains(args, network) != want {
+			t.Errorf("mode %q: network access %v, want %v: %q", mode, !want, want, args)
+		}
+		if c.Args[len(c.Args)-1] != "p" {
+			t.Errorf("mode %q: the prompt is not the last argument: %q", mode, c.Args)
+		}
+	}
+}

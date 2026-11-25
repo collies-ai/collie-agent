@@ -291,8 +291,8 @@ type Codex struct{}
 // Binary is codex.
 func (Codex) Binary() string { return "codex" }
 
-// codexSandbox maps collie's permission modes to codex's sandbox: auto writes inside the workspace, full has no
-// sandbox, plan is read-only. Anything else is auto.
+// codexSandbox maps collie's permission modes to codex's sandbox: auto writes inside the workspace (with the network
+// on), full has no sandbox, plan is read-only. Anything else is auto.
 var codexSandbox = map[string]string{"auto": "workspace-write", "full": "danger-full-access", "plan": "read-only"}
 
 // Command builds the codex exec command line.
@@ -301,19 +301,26 @@ func (Codex) Command(l Launch) (Command, error) {
 	if !ok {
 		sandbox = codexSandbox["auto"]
 	}
+	var network []string
+	if sandbox == "workspace-write" {
+		// workspace-write cuts the network by default, and with approval_policy never nothing can ask for it: tests that
+		// listen on localhost and gh (a review's comment on the PR) fail. Writes stay inside the worktree.
+		network = []string{"-c", "sandbox_workspace_write.network_access=true"}
+	}
 	url, _ := json.Marshal(l.MCPURL)
 	env, _ := json.Marshal(l.TokenEnv)
 	return Command{
 		Binary: "codex",
-		Args: []string{
+		Args: append(append([]string{
 			"exec", "--json",
 			"--cd", l.Worktree,
 			"--sandbox", sandbox,
 			"-c", "approval_policy=\"never\"",
+		}, network...), []string{
 			"-c", "mcp_servers.collie.url=" + string(url),
 			"-c", "mcp_servers.collie.bearer_token_env_var=" + string(env),
 			l.Prompt,
-		},
+		}...),
 	}, nil
 }
 
