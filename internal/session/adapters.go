@@ -23,6 +23,7 @@ type Launch struct {
 	Prompt         string
 	MCPURL         string
 	PermissionMode string // the binding's mode: auto, full or plan
+	Purpose        string // the dispatch's purpose: code, research, reviewer or qa-browser
 	Binary         string // the agent CLI's resolved path
 	// TokenEnv is the environment variable that holds the session token: adapters reference it and never write the
 	// token itself to a file or a command line, where other users could read it.
@@ -307,6 +308,16 @@ func (Codex) Command(l Launch) (Command, error) {
 		// listen on localhost and gh (a review's comment on the PR) fail. Writes stay inside the worktree.
 		network = []string{"-c", "sandbox_workspace_write.network_access=true"}
 	}
+	// A review answers with the review itself (ReviewFile), in the shape collie takes: codex enforces it. Any agent is
+	// also told where to write it (COLLIE_REVIEW_FILE, set by the manager).
+	var review []string
+	if l.Purpose == "reviewer" {
+		schema, err := writeReviewSchema(l.SessionDir)
+		if err != nil {
+			return Command{}, err
+		}
+		review = []string{"--output-schema", schema, "-o", filepath.Join(l.SessionDir, ReviewFile)}
+	}
 	url, _ := json.Marshal(l.MCPURL)
 	env, _ := json.Marshal(l.TokenEnv)
 	return Command{
@@ -316,7 +327,7 @@ func (Codex) Command(l Launch) (Command, error) {
 			"--cd", l.Worktree,
 			"--sandbox", sandbox,
 			"-c", "approval_policy=\"never\"",
-		}, network...), []string{
+		}, append(network, review...)...), []string{
 			"-c", "mcp_servers.collie.url=" + string(url),
 			"-c", "mcp_servers.collie.bearer_token_env_var=" + string(env),
 			l.Prompt,

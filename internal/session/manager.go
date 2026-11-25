@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,9 @@ import (
 	"github.com/collies-ai/collie-agent/internal/machine"
 )
 
+// ReviewFile is where a review agent that takes an output schema writes its answer, in the session dir.
+const ReviewFile = "review.json"
+
 // TokenEnv is the environment variable that carries the session token to the agent.
 const TokenEnv = "COLLIE_SESSION_TOKEN"
 
@@ -32,7 +36,7 @@ const TokenEnv = "COLLIE_SESSION_TOKEN"
 type API interface {
 	RenewSessionToken(ctx context.Context, sessionID int64) (time.Time, error)
 	SessionStarted(ctx context.Context, sessionID int64, sessionURL string) error
-	SessionFinished(ctx context.Context, sessionID int64, exitCode int, usage *machine.Usage) error
+	SessionFinished(ctx context.Context, sessionID int64, exitCode int, usage *machine.Usage, review json.RawMessage) error
 }
 
 // Manager runs sessions. It implements dispatch.Sessions.
@@ -58,6 +62,8 @@ type Manager struct {
 	// gets to exit after its exit command is typed (default 30 seconds) before it is stopped.
 	IdleTimeout time.Duration
 	IdlePoll    time.Duration
+	// Setup is the local config's session_setup: a command per purpose run in the worktree before the agent starts.
+	Setup map[string]string
 	// AnswerSettle is how long the answer to a startup dialog waits once the dialog showed (default 500ms), and
 	// AnswerKeyGap the pause between its keys (default 150ms).
 	AnswerSettle time.Duration
@@ -218,7 +224,8 @@ func (m *Manager) run(ctx context.Context, s dispatch.Session, a Adapter, binary
 	if err != nil {
 		m.logf("session %d: %v", s.ID, err)
 	}
-	emit("finished", func(c context.Context) error { return m.API.SessionFinished(c, s.ID, exitCode, usage) })
+	review := m.readReview(s.ID, dir)
+	emit("finished", func(c context.Context) error { return m.API.SessionFinished(c, s.ID, exitCode, usage, review) })
 	close(events)
 	<-sent
 	m.logf("session %d finished with exit code %d", s.ID, exitCode)
@@ -234,11 +241,14 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 	if err := addWorktree(ctx, s.Binding.Folder, dir, worktree, branch); err != nil {
 		return -1, nil, fmt.Errorf("creating the worktree: %w", err)
 	}
+	if err := m.setup(ctx, s, worktree); err != nil {
+		return -1, nil, err
+	}
 	name := fmt.Sprintf("collie %s #%d", s.Dispatch.Project, s.ID)
 	payload := payloadText(s.Dispatch)
 	spec, err := a.Command(Launch{
 		Name: name, Worktree: worktree, Prompt: PromptFor(s.Dispatch.Purpose, payload), MCPURL: mcpURL(s),
-		PermissionMode: s.Binding.PermissionMode, Binary: binary, TokenEnv: TokenEnv, SessionDir: dir,
+		PermissionMode: s.Binding.PermissionMode, Purpose: s.Dispatch.Purpose, Binary: binary, TokenEnv: TokenEnv, SessionDir: dir,
 	})
 	if err != nil {
 		return -1, nil, err
@@ -254,6 +264,15 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 	cmd.Dir = worktree
 	cmd.Env = append(os.Environ(), spec.Env...)
 	cmd.Env = append(cmd.Env, TokenEnv+"="+s.Accepted.SessionToken, "COLLIE_MCP_URL="+mcpURL(s))
+	if s.Dispatch.Purpose == "reviewer" {
+		// Whatever the agent, a review can answer in collie's review shape: collie's review steps tell it to write the
+		// verdict to COLLIE_REVIEW_FILE (codex is also held to it by --output-schema), and readReview sends it.
+		schema, err := writeReviewSchema(dir)
+		if err != nil {
+			return -1, nil, err
+		}
+		cmd.Env = append(cmd.Env, "COLLIE_REVIEW_FILE="+filepath.Join(dir, ReviewFile), "COLLIE_REVIEW_SCHEMA="+schema)
+	}
 	var (
 		out   io.Reader
 		tty   *os.File       // the terminal of an interactive agent
@@ -506,6 +525,62 @@ func stripEscapes(s string) string {
 		return strings.Repeat(" ", min(max(n, 1), 256))
 	})
 	return escapes.ReplaceAllString(s, "")
+}
+
+// setup runs the local config's session_setup command for the dispatch's purpose in the worktree, before the agent
+// starts: whatever the person needs there (an identity for the agent, tooling). Its output goes to the session's
+// log. A command that fails, or runs past two minutes, stops the session: its agent would run without it.
+func (m *Manager) setup(ctx context.Context, s dispatch.Session, worktree string) error {
+	command := strings.TrimSpace(m.Setup[s.Dispatch.Purpose])
+	if command == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", command)
+	cmd.Dir = worktree
+	cmd.Env = append(os.Environ(),
+		"COLLIE_SESSION_ID="+strconv.FormatInt(s.ID, 10), "COLLIE_PURPOSE="+s.Dispatch.Purpose,
+		"COLLIE_PROJECT="+s.Dispatch.Project, "COLLIE_CODEBASE="+s.Dispatch.Codebase)
+	out, err := cmd.CombinedOutput()
+	m.logf("session %d: session_setup (%s): %s", s.ID, s.Dispatch.Purpose, strings.TrimSpace(string(out)))
+	if err != nil {
+		tail := strings.TrimSpace(string(out))
+		if len(tail) > 300 {
+			tail = tail[len(tail)-300:]
+		}
+		return fmt.Errorf("session_setup for %s failed: %v: %s", s.Dispatch.Purpose, err, tail)
+	}
+	return nil
+}
+
+// writeReviewSchema writes the review shape to the session dir and returns its path.
+func writeReviewSchema(dir string) (string, error) {
+	schema := filepath.Join(dir, "review.schema.json")
+	if err := os.WriteFile(schema, reviewSchema, 0o600); err != nil {
+		return "", fmt.Errorf("writing the review schema: %w", err)
+	}
+	return schema, nil
+}
+
+// readReview returns the review the agent answered with (ReviewFile), when it wrote one with a known verdict.
+func (m *Manager) readReview(id int64, dir string) json.RawMessage {
+	b, err := os.ReadFile(filepath.Join(dir, ReviewFile))
+	if err != nil {
+		return nil
+	}
+	var r struct {
+		Verdict string `json:"verdict"`
+	}
+	if json.Unmarshal(b, &r) != nil || (r.Verdict != "approve" && r.Verdict != "changes_requested" && r.Verdict != "escalate") {
+		m.logf("session %d: the review the agent wrote is not valid; not sent", id)
+		return nil
+	}
+	var compact bytes.Buffer
+	if json.Compact(&compact, b) != nil {
+		return nil
+	}
+	return compact.Bytes()
 }
 
 // typeKeys types an answer into the agent's terminal, one key at a time: Claude Code drops keys that arrive while it

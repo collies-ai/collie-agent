@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "collie code review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "reason", "findings"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["approve", "changes_requested", "escalate"] },
+    "summary": { "type": "string", "description": "Two to five sentences on the change, what you verified (files read, tests run) and the verdict." },
+    "reason": { "type": "string", "description": "With escalate: what a person has to decide and why. Otherwise empty." },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pr_number", "path", "line", "blocking", "severity", "origin", "body"],
+        "properties": {
+          "pr_number": { "type": "integer", "description": "The PR the finding belongs to (one of a stack)." },
+          "path": { "type": "string", "description": "File path relative to the repo root, as in the PR diff." },
+          "line": { "type": "integer", "description": "Line in the new version of the file, inside a hunk of that PR's diff." },
+          "blocking": { "type": "boolean", "description": "true only for what must change before the merge: a bug, a broken contract, a missing check, a security problem." },
+          "severity": { "type": ["string", "null"], "enum": ["critical", "major", "minor", null], "description": "Blocking findings: critical (security, permissions, data loss), major (wrong behavior on a common path) or minor (a narrow race or edge case). null otherwise." },
+          "origin": { "type": ["string", "null"], "enum": ["new", "left_over", null], "description": "Blocking findings: new (introduced by this round's diff) or left_over (already in code an earlier round reviewed). null otherwise." },
+          "body": { "type": "string", "description": "What is wrong, why it matters and what to do." }
+        }
+      }
+    }
+  }
+}

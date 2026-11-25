@@ -321,7 +321,7 @@ func (a *App) run(p config.Profile, args []string) int {
 		if max <= 0 {
 			max = agent.DefaultMaxConcurrency
 		}
-		r.Sessions = &session.Manager{API: sapi, Dir: filepath.Join(p.Dir, "sessions"), Log: logger, MaxConcurrency: max}
+		r.Sessions = &session.Manager{API: sapi, Dir: filepath.Join(p.Dir, "sessions"), Log: logger, MaxConcurrency: max, Setup: settings.SessionSetup}
 	}
 	logger.Printf("collie-agent %s running as machine #%s with %s (profile %q, %d root folders)", version.Version, creds.MachineID, creds.Server, p.Name, len(settings.RootFolders))
 	if err := r.Loop(a.ctx()); err != nil {
