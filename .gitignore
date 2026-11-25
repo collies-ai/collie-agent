@@ -1,0 +1,4 @@
+/dist/
+/collie-agent
+*.test
+coverage.out
