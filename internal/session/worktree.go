@@ -166,10 +166,12 @@ func addWorktree(ctx context.Context, repo, sessionDir, wt, branch string) error
 	return err
 }
 
-// removeWorktree removes the session's worktree and its local branch (whatever the agent pushed stays on the remote),
-// then the session's directory. It keeps going on errors and returns the first one.
-func removeWorktree(ctx context.Context, sessionDir string) error {
+// removeWorktree stops the processes still running in the session's worktree (stopProcessesIn), removes the worktree
+// and its local branch (whatever the agent pushed stays on the remote), then the session's directory. It returns how
+// many processes it stopped, keeps going on errors and returns the first one.
+func removeWorktree(ctx context.Context, sessionDir string) (int, error) {
 	var first error
+	stopped := 0
 	keep := func(err error) {
 		if err != nil && first == nil {
 			first = err
@@ -186,6 +188,7 @@ func removeWorktree(ctx context.Context, sessionDir string) error {
 			if !ownedWorktree(m.Repo, sessionDir, wt) {
 				keep(fmt.Errorf("%s: worktree %q is not a session worktree; left alone", metaFile, wt))
 			} else if _, statErr := os.Stat(wt); statErr == nil {
+				stopped = stopProcessesIn(ctx, wt)
 				_, err := git(ctx, m.Repo, "worktree", "remove", "--force", wt)
 				keep(err)
 			}
@@ -198,7 +201,7 @@ func removeWorktree(ctx context.Context, sessionDir string) error {
 		keep(err)
 	}
 	keep(os.RemoveAll(sessionDir))
-	return first
+	return stopped, first
 }
 
 // Sweep removes the worktrees of sessions that are not running: what a crash or a kill left behind. It returns how
@@ -217,7 +220,7 @@ func Sweep(ctx context.Context, sessionsDir string, running func(name string) bo
 		if !e.IsDir() || (running != nil && running(e.Name())) {
 			continue
 		}
-		if err := removeWorktree(ctx, filepath.Join(sessionsDir, e.Name())); err != nil && first == nil {
+		if _, err := removeWorktree(ctx, filepath.Join(sessionsDir, e.Name())); err != nil && first == nil {
 			first = err
 		}
 		n++

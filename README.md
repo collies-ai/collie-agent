@@ -125,7 +125,7 @@ instead.
   - **Codex** runs headless (`codex exec --json`), and the token usage of its turns goes to collie with the session's
     end;
   - output goes to `<profile dir>/sessions/<id>/agent.log`, next to the session's private files (MCP config, hooks). When the agent exits (or the token dies, or the service
-    stops, which stops it) collie-agent reports the exit code and removes the worktree and the branch it created.
+    stops, which stops it) collie-agent reports the exit code, stops the processes still running in the worktree (whatever the agent left outside its process group, such as a `nohup … &` or a dev server that daemonizes: SIGTERM, then SIGKILL after 5 seconds) and removes the worktree and the branch it created.
     Leftover worktrees from a crash are removed when `run` starts. Lifecycle reports never hold the agent up.
   - The agent runs as your OS user, with your access: bind only repos you trust collie's work in.
 - A 401 anywhere, session endpoints included, means the machine was revoked: everything stops.

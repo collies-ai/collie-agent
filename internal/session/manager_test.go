@@ -9,9 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -113,6 +115,7 @@ if [ "$name" = claude ]; then
     if [ "$answer" != "$(printf '\033[B')" ]; then echo "refused: $answer" > "$out/trusted"; exit 7; fi
   fi
   echo trusted > "$out/trusted"
+  if [ -n "$FAKE_ORPHAN" ]; then nohup sleep 60 >/dev/null 2>&1 & echo $! > "$out/orphan"; fi
   touch "$sdir/activity"
   printf 'Remote Control \033]8;;https://claude.ai/code/session_01TESTabc-_9\033\\/rc active\033]8;;\033\\\n'
   if [ -n "$FAKE_IDLE" ]; then
@@ -918,7 +921,7 @@ func TestCleanupLeavesAForeignWorktreeAlone(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, metaFile), []byte(`{"repo":"`+repo+`","worktree":"`+other+`"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := removeWorktree(context.Background(), dir); err == nil {
+	if _, err := removeWorktree(context.Background(), dir); err == nil {
 		t.Error("no error for a worktree that is not a session's")
 	}
 	if _, err := os.Stat(other); err != nil {
@@ -991,7 +994,7 @@ func TestABranchIsOwnedFromItsCreation(t *testing.T) {
 	if err := addWorktree(context.Background(), repo, sessionDir, wt, "collie/session-91"); err == nil {
 		t.Fatal("addWorktree succeeded on a taken path")
 	}
-	if err := removeWorktree(context.Background(), sessionDir); err != nil {
+	if _, err := removeWorktree(context.Background(), sessionDir); err != nil {
 		t.Logf("removeWorktree: %v", err)
 	}
 	if b := gitRun(t, repo, "branch", "--list", "collie/session-91"); b != "" {
@@ -1023,7 +1026,7 @@ func TestAStopAfterTheBranchIsCreatedDoesNotOrphanIt(t *testing.T) {
 	if err := <-errc; err == nil {
 		t.Fatal("addWorktree succeeded although it was stopped")
 	}
-	if err := removeWorktree(context.Background(), sessionDir); err != nil {
+	if _, err := removeWorktree(context.Background(), sessionDir); err != nil {
 		t.Logf("removeWorktree: %v", err)
 	}
 	if b := gitRun(t, repo, "branch", "--list", "collie/session-92"); b != "" {
@@ -1066,4 +1069,77 @@ func TestClaudeRunsInItsAutoModeWhenItHasOne(t *testing.T) {
 			t.Errorf("mode %q with %q: %q, want %q", c.mode, c.modes, got, c.want)
 		}
 	}
+}
+
+// started runs cmd in dir, in a session of its own (out of any process group collie-agent signals), and returns it.
+func started(t *testing.T, dir, script string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+	return cmd
+}
+
+func exited(cmd *exec.Cmd, within time.Duration) bool {
+	done := make(chan struct{})
+	go func() { _, _ = cmd.Process.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(within):
+		return false
+	}
+}
+
+// Processes the agent left in its worktree outside its process group are stopped before the worktree is removed:
+// SIGTERM, then SIGKILL for one that ignores it. A process outside the worktree is left alone.
+func TestRemovingAWorktreeStopsTheProcessesLeftInIt(t *testing.T) {
+	m, _, repo, _ := env(t)
+	grace := ProcessGrace
+	ProcessGrace = 300 * time.Millisecond
+	t.Cleanup(func() { ProcessGrace = grace })
+	dir := filepath.Join(m.Dir, "87")
+	wt := WorktreePath(repo, 87)
+	if err := addWorktree(context.Background(), repo, dir, wt, "collie/session-87"); err != nil {
+		t.Fatal(err)
+	}
+	sub := filepath.Join(wt, "web")
+	_ = os.MkdirAll(sub, 0o755)
+	server := started(t, sub, "exec sleep 60")
+	stubborn := started(t, wt, `trap "" TERM; sleep 60 & wait`)
+	outside := started(t, repo, "exec sleep 60")
+	waitUntil(t, "the processes to show up", func() bool { return len(processesIn(context.Background(), wt)) >= 2 })
+
+	stopped, err := removeWorktree(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped < 2 {
+		t.Errorf("stopped %d processes, want at least the 2 in the worktree", stopped)
+	}
+	if !exited(server, 5*time.Second) {
+		t.Error("a process in the worktree is still running")
+	}
+	if !exited(stubborn, 5*time.Second) {
+		t.Error("a process that ignores SIGTERM is still running")
+	}
+	if exited(outside, 300*time.Millisecond) {
+		t.Error("a process outside the worktree was stopped")
+	}
+}
+
+// What a session leaves behind when the agent exits on its own: a `nohup … &` that survives the end of its group.
+func TestASessionLeavesNoProcessBehind(t *testing.T) {
+	m, _, repo, out := env(t)
+	t.Setenv("FAKE_ORPHAN", "1")
+	run(t, m, session(88, "claude", repo, "auto"))
+	pid, err := strconv.Atoi(read(t, filepath.Join(out, "claude", "orphan")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "the orphan to be stopped", func() bool { return syscall.Kill(pid, 0) != nil })
 }
