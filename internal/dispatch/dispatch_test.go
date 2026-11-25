@@ -373,3 +373,38 @@ func TestResearchRunsOnTheCodeAgentWithoutAResearchAgent(t *testing.T) {
 		t.Errorf("research ran on %+v, want the code agent, then the binding's own research agent", sess.started)
 	}
 }
+
+// Builds filling the machine-wide limit (one of them waiting for its review) leave room for reviews, which only their
+// binding limits; another build is declined. collie counts the same way.
+func TestReviewsAreNotHeldByTheMachineWideLimit(t *testing.T) {
+	api := &fakeAPI{}
+	sess := &fakeSessions{}
+	d := &Dispatcher{API: api, Sessions: sess, MaxConcurrency: 2}
+	// One binding takes both purposes here: its limit (3) counts the builds and the reviews alike.
+	setBindings(t, d, []bindings.Binding{binding(1, "/code/collie", 3)})
+	ctx := context.Background()
+	review := func(id int64) machine.Dispatch { o := offer(id, 1); o.Purpose = "reviewer"; return o }
+
+	_ = d.Handle(ctx, offer(1, 1))
+	_ = d.Handle(ctx, offer(2, 1))
+	_ = d.Handle(ctx, review(3))
+	_ = d.Handle(ctx, offer(4, 1))
+	_ = d.Handle(ctx, review(5))
+	_ = d.Handle(ctx, review(6))
+
+	want := []bool{true, true, true, false, false, false}
+	if len(api.acks) != len(want) {
+		t.Fatalf("acks = %+v", api.acks)
+	}
+	for i, a := range api.acks {
+		if a.Accept != want[i] {
+			t.Errorf("offer %d: accepted %v (%s), want %v", a.DispatchID, a.Accept, a.Reason, want[i])
+		}
+	}
+	if r := api.acks[3].Reason; !strings.Contains(r, "machine at capacity (2 of 2") {
+		t.Errorf("the third build was declined with %q", r)
+	}
+	if r := api.acks[4].Reason; !strings.Contains(r, "binding at capacity (3 of 3") {
+		t.Errorf("the review over its binding's limit was declined with %q", r)
+	}
+}

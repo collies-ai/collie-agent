@@ -61,8 +61,8 @@ type Dispatcher struct {
 
 	mu          sync.Mutex
 	bindings    map[int64]bindings.Binding // by runner id
-	running     map[int64]int64            // session id → runner id
-	reserved    map[int64]int64            // offers being acked: session id → runner id
+	running     map[int64]slot             // session id → its slot
+	reserved    map[int64]slot             // offers being acked: session id → its slot
 	handled     map[int64]bool             // offer (session) ids already handled, so the cable and the long-poll don't ack twice
 	rootFolders []bindings.Root
 }
@@ -189,7 +189,7 @@ func (d *Dispatcher) reserve(key int64, m machine.Dispatch) (string, bindings.Bi
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.handled == nil {
-		d.handled, d.running, d.reserved = map[int64]bool{}, map[int64]int64{}, map[int64]int64{}
+		d.handled, d.running, d.reserved = map[int64]bool{}, map[int64]slot{}, map[int64]slot{}
 	}
 	if d.handled[key] {
 		return "duplicate", bindings.Binding{}, ""
@@ -210,28 +210,38 @@ func (d *Dispatcher) reserve(key int64, m machine.Dispatch) (string, bindings.Bi
 	if err := d.Sessions.CanRun(agent); err != nil {
 		return err.Error(), b, ""
 	}
+	uncapped := uncappedPurposes[m.Purpose]
 	busy, busyRunner := 0, 0
-	for _, r := range d.running {
-		busy++
-		if r == b.RunnerID {
-			busyRunner++
+	for _, slots := range []map[int64]slot{d.running, d.reserved} {
+		for _, s := range slots {
+			if !s.uncapped {
+				busy++
+			}
+			if s.runner == b.RunnerID {
+				busyRunner++
+			}
 		}
 	}
-	for _, r := range d.reserved {
-		busy++
-		if r == b.RunnerID {
-			busyRunner++
-		}
-	}
-	if max := d.MaxConcurrency; max > 0 && busy >= max {
+	if max := d.MaxConcurrency; max > 0 && !uncapped && busy >= max {
 		return fmt.Sprintf("machine at capacity (%d of %d sessions)", busy, max), b, ""
 	}
 	if busyRunner >= b.MaxConcurrency {
 		return fmt.Sprintf("binding at capacity (%d of %d sessions)", busyRunner, b.MaxConcurrency), b, ""
 	}
-	d.reserved[key] = b.RunnerID
+	d.reserved[key] = slot{runner: b.RunnerID, uncapped: uncapped}
 	return "", b, agent
 }
+
+// slot is a session taking room on this machine: its binding, and whether it is left out of the machine-wide limit.
+type slot struct {
+	runner   int64
+	uncapped bool
+}
+
+// uncappedPurposes are the purposes whose sessions neither count against the machine-wide MaxConcurrency nor wait for
+// it: only their binding's limit applies. A review is short, and the builds holding the machine's slots are often the
+// ones waiting for it; collie counts the same way (MachineDelivery::UNCAPPED_PURPOSES).
+var uncappedPurposes = map[string]bool{"reviewer": true}
 
 // agentFor picks the binding's agent for a purpose; "code" is collie's default purpose.
 // agentFor is the binding's agent for the dispatch's purpose. Research with no research agent of its own runs on the
@@ -261,8 +271,12 @@ func (d *Dispatcher) forget(key int64) {
 
 func (d *Dispatcher) promote(key, sessionID, runnerID int64) {
 	d.mu.Lock()
+	s, ok := d.reserved[key]
+	if !ok {
+		s = slot{runner: runnerID}
+	}
 	delete(d.reserved, key)
-	d.running[sessionID] = runnerID
+	d.running[sessionID] = s
 	d.mu.Unlock()
 }
 
