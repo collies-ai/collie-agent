@@ -166,8 +166,9 @@ Commits follow [Conventional Commits](https://www.conventionalcommits.org): `<ty
 with type `feat`, `fix`, `perf`, `revert`, `build`, `chore`, `ci`, `docs`, `refactor`, `style` or `test`. CI checks
 every commit of a pull request (`scripts/check-commits.sh`).
 
-Every merge to `main` releases by itself. `.github/workflows/release.yml` asks `scripts/next-version.sh` for the next
-version from the commits since the last `v*` tag:
+Every merge to `main` releases by itself. `.github/workflows/release.yml` runs `scripts/release.sh`, which tags
+every commit on `main` since the last `v*` tag that brings a releasable change, each with the version
+`scripts/next-version.sh` picks from the commits it adds:
 
 | Commits since the last tag | Release |
 | --- | --- |
@@ -176,10 +177,12 @@ version from the commits since the last `v*` tag:
 | `fix`, `perf`, `revert` | patch |
 | only `build`, `chore`, `ci`, `docs`, `refactor`, `style`, `test` | none |
 
-It tags the commit, runs the tests and [GoReleaser](https://goreleaser.com) (`.goreleaser.yaml`), which publishes
-`collie-agent_<os>_<arch>.tar.gz` for darwin and linux on amd64 and arm64, `checksums.txt` and `install.sh` to the
-GitHub release, with a changelog grouped by type. Then it installs that release with `install.sh` on Linux and macOS.
-The first release is `v0.1.0`. To pick a version by hand, push the tag yourself:
+Then it publishes, with [GoReleaser](https://goreleaser.com) (`.goreleaser.yaml`), every `v*` tag whose release is
+missing or incomplete: `collie-agent_<os>_<arch>.tar.gz` for darwin and linux on amd64 and arm64, `checksums.txt` and
+`install.sh`, with a changelog grouped by type. A release run that failed, was canceled or was dropped from the queue
+is therefore finished by the next run (or by running the workflow by hand on `main`). Only the highest version is
+marked latest. Finally it installs that release with `install.sh` on Linux and macOS. The first release is `v0.1.0`.
+To pick a version by hand, push the tag yourself:
 
 ```sh
 git tag v1.0.0 && git push origin v1.0.0
