@@ -277,6 +277,19 @@ trust_level = "trusted"
 			t.Errorf("broken config %q trusted %v", broken, got)
 		}
 	}
+	// TOML forbids defining a key or a table twice: an ambiguous trust trusts nothing.
+	for _, dup := range []string{
+		`[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n" + `trust_level = "untrusted"` + "\n",
+		`[projects."` + good + `"]` + "\n" + `trust_level = "untrusted"` + "\n" + `trust_level = "trusted"` + "\n",
+		`[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n" + `trust_level = "trusted"` + "\n",
+		`[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n" + `[projects."` + good + `"]` + "\n" + `trust_level = "untrusted"` + "\n",
+		`[projects."` + good + `"]` + "\n" + `trust_level = 1` + "\n" + `trust_level = "trusted"` + "\n",
+	} {
+		write(dup)
+		if got := paths(); len(got) != 0 {
+			t.Errorf("ambiguous trust %q trusted %v", dup, got)
+		}
+	}
 	// A trust value that is not a plain one-line string is not trusted.
 	write(`[projects."` + good + `"]` + "\n" + `trust_level = """trusted"""` + "\n")
 	if got := paths(); len(got) != 0 {
