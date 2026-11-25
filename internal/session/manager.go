@@ -58,7 +58,11 @@ type Manager struct {
 	// gets to exit after its exit command is typed (default 30 seconds) before it is stopped.
 	IdleTimeout time.Duration
 	IdlePoll    time.Duration
-	ExitGrace   time.Duration
+	// AnswerSettle is how long the answer to a startup dialog waits once the dialog showed (default 500ms), and
+	// AnswerKeyGap the pause between its keys (default 150ms).
+	AnswerSettle time.Duration
+	AnswerKeyGap time.Duration
+	ExitGrace    time.Duration
 
 	mu        sync.Mutex
 	running   map[int64]bool
@@ -183,7 +187,9 @@ func (m *Manager) Start(ctx context.Context, s dispatch.Session, done func()) er
 // collie never holds up the agent, its output or its supervision.
 func (m *Manager) run(ctx context.Context, s dispatch.Session, a Adapter, binary string) {
 	dir := filepath.Join(m.Dir, strconv.FormatInt(s.ID, 10))
-	worktree := filepath.Join(dir, "worktree")
+	// The folder was resolved and checked against the root folders when the offer was accepted: use that path as is,
+	// without resolving it again. The worktree goes inside it (WorktreePath).
+	worktree := WorktreePath(s.Binding.Folder, s.ID)
 	defer func() {
 		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
@@ -220,10 +226,8 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return -1, nil, err
 	}
-	// The folder was resolved and checked against the root folders when the offer was accepted: use that path as is,
-	// without resolving it again.
 	branch := fmt.Sprintf("collie/session-%d", s.ID)
-	if err := addWorktree(ctx, s.Binding.Folder, worktree, branch); err != nil {
+	if err := addWorktree(ctx, s.Binding.Folder, dir, worktree, branch); err != nil {
 		return -1, nil, fmt.Errorf("creating the worktree: %w", err)
 	}
 	name := fmt.Sprintf("collie %s #%d", s.Dispatch.Project, s.ID)
@@ -294,6 +298,7 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 	go func() {
 		defer close(scanned)
 		answered := make([]bool, len(spec.Answers))
+		dialogs := make([][]string, len(spec.Answers)) // the lines of each dialog since its question showed
 		sc := bufio.NewScanner(out)
 		sc.Buffer(make([]byte, 64*1024), maxLine+1)
 		sc.Split(lineSplitter(maxLine))
@@ -312,10 +317,26 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 				emit("started", func(c context.Context) error { return m.API.SessionStarted(c, s.ID, url) })
 			}
 			for i, ans := range spec.Answers {
-				if !answered[i] && tty != nil && m.startingUp(dir, started) && ans.Match.MatchString(text) {
-					answered[i] = true
-					_, _ = tty.WriteString(ans.Input)
+				if answered[i] || tty == nil || !m.startingUp(dir, started) {
+					continue
 				}
+				if dialogs[i] == nil && ans.Match.MatchString(text) {
+					dialogs[i] = []string{}
+				}
+				if dialogs[i] == nil {
+					continue
+				}
+				dialogs[i] = append(dialogs[i], text)
+				keys, done := ans.respond(dialogs[i])
+				if !done {
+					continue
+				}
+				answered[i] = true
+				if len(keys) == 0 {
+					m.logf("session %d: %s shows a dialog collie-agent cannot answer; answer it in the session", s.ID, a.Binary())
+					continue
+				}
+				go typeKeys(tty, keys, m.answerSettle(), m.answerKeyGap())
 			}
 		}
 		_, _ = io.Copy(io.Discard, out)
@@ -377,6 +398,20 @@ loop:
 // it started less than StartupWindow ago. Only then are startup dialogs answered.
 func (m *Manager) startingUp(dir string, started time.Time) bool {
 	return time.Since(started) < StartupWindow && mtime(filepath.Join(dir, ActivityFile)).IsZero()
+}
+
+func (m *Manager) answerSettle() time.Duration {
+	if m.AnswerSettle > 0 {
+		return m.AnswerSettle
+	}
+	return 500 * time.Millisecond
+}
+
+func (m *Manager) answerKeyGap() time.Duration {
+	if m.AnswerKeyGap > 0 {
+		return m.AnswerKeyGap
+	}
+	return 150 * time.Millisecond
 }
 
 func (m *Manager) idleTimeout() time.Duration {
@@ -457,7 +492,31 @@ func lineSplitter(max int) bufio.SplitFunc {
 // escapes.
 var escapes = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]`)
 
-func stripEscapes(s string) string { return escapes.ReplaceAllString(s, "") }
+// cursorForward is CSI n C: an interactive CLI such as Claude Code draws the spaces between words with it.
+var cursorForward = regexp.MustCompile(`\x1b\[([0-9]*)C`)
+
+// stripEscapes removes the control sequences, keeping the spaces that cursor moves forward stand for.
+func stripEscapes(s string) string {
+	s = cursorForward.ReplaceAllStringFunc(s, func(seq string) string {
+		n, _ := strconv.Atoi(seq[2 : len(seq)-1])
+		return strings.Repeat(" ", min(max(n, 1), 256))
+	})
+	return escapes.ReplaceAllString(s, "")
+}
+
+// typeKeys types an answer into the agent's terminal, one key at a time: Claude Code drops keys that arrive while it
+// is still drawing the dialog, or together in one read.
+func typeKeys(tty *os.File, keys []string, settle, gap time.Duration) {
+	time.Sleep(settle)
+	for i, k := range keys {
+		if i > 0 {
+			time.Sleep(gap)
+		}
+		if _, err := tty.WriteString(k); err != nil {
+			return
+		}
+	}
+}
 
 // stop sends the agent's process group SIGTERM, then SIGKILL after KillGrace, and waits for it.
 func (m *Manager) stop(cmd *exec.Cmd, waited <-chan error) {

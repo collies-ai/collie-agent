@@ -44,11 +44,21 @@ type Command struct {
 // StartupWindow is how long after the start a startup dialog is still answered.
 const StartupWindow = 2 * time.Minute
 
-// Answer is input typed into an interactive agent when a line of its output (without escape codes) matches, while
-// it starts up.
+// Answer is typed into an interactive agent when a dialog shows while it starts up. Match finds the dialog's first
+// line in the output (without escape codes). Then, with Respond, the dialog's lines so far are passed on every new
+// line until it is done, and the keys it returns are typed one by one (none: the dialog was not understood and is
+// left to a person); without Respond, Input is typed right away.
 type Answer struct {
-	Match *regexp.Regexp
-	Input string
+	Match   *regexp.Regexp
+	Input   string
+	Respond func(lines []string) (keys []string, done bool)
+}
+
+func (a Answer) respond(lines []string) ([]string, bool) {
+	if a.Respond != nil {
+		return a.Respond(lines)
+	}
+	return []string{a.Input}, true
 }
 
 // The marker files an interactive agent's hooks touch in its session dir: activity when it works (a prompt, a tool),
@@ -95,10 +105,67 @@ func (Claude) Binary() string { return "claude" }
 // prompt, plan only plans. Anything else is auto.
 var claudePermission = map[string]string{"auto": "acceptEdits", "full": "bypassPermissions", "plan": "plan"}
 
-// claudeTrust matches the question of the workspace trust dialog a new folder shows, and nothing else: an option
-// label such as "Yes, proceed" also appears in other dialogs. The worktree is a checkout of a repo the person bound
-// inside their root folders, so collie-agent accepts it (Enter on the default "Yes, proceed").
-var claudeTrust = regexp.MustCompile(`(?i)do you trust the files in this folder\?`)
+// claudeTrust matches the question of the workspace trust dialog a folder Claude Code was never trusted in shows,
+// and nothing else: an option label such as "Yes, proceed" also appears in other dialogs. Older versions ask "Do you
+// trust the files in this folder?" with "Yes, proceed" selected; 2.1 asks "Is this a project you created or one you
+// trust?" with "No, exit" selected. The worktree is a checkout of a repo the person bound inside their root folders,
+// so collie-agent accepts it (claudeTrustKeys). A worktree inside a repo the person already trusted asks nothing.
+var claudeTrust = regexp.MustCompile(`(?i)do\s*you\s*trust\s*the\s*files\s*in\s*this\s*folder\s*\?|is\s*this\s*a\s*project\s*you\s*created\s*or\s*one\s*you\s*trust\s*\?`)
+
+var (
+	// trustOption is an option of the trust dialog once compacted (no spaces, lower case, frame and marker removed).
+	trustOption = regexp.MustCompile(`^(\d+\.)?(yes|no),`)
+	trustYes    = regexp.MustCompile(`^(\d+\.)?yes,(itrustthisfolder|proceed)`)
+	// trustEnd is the dialog's footer: every option has been drawn by then.
+	trustEnd = regexp.MustCompile(`(?i)enter\s*to\s*confirm`)
+)
+
+// Keys of a terminal.
+const (
+	keyUp    = "\x1b[A"
+	keyDown  = "\x1b[B"
+	keyEnter = "\r"
+)
+
+// claudeTrustKeys answers the trust dialog with "Yes": once its footer shows, it moves the selection from the selected
+// option (❯) to the "Yes" one, then confirms. A dialog whose options it cannot tell apart is left to a person, never
+// answered blind: Enter on a default "No, exit" ends the session.
+func claudeTrustKeys(lines []string) ([]string, bool) {
+	if len(lines) > 40 {
+		return nil, true // no footer: not the dialog we know
+	}
+	if !trustEnd.MatchString(lines[len(lines)-1]) {
+		return nil, false
+	}
+	selected, yes, n := -1, -1, 0
+	for _, line := range lines {
+		t := strings.ToLower(strings.Join(strings.Fields(strings.ReplaceAll(line, "\u00a0", " ")), ""))
+		t = strings.Trim(t, "│|")
+		marked := strings.HasPrefix(t, "❯") || strings.HasPrefix(t, ">")
+		t = strings.TrimLeft(t, "❯>")
+		if !trustOption.MatchString(t) {
+			continue
+		}
+		if marked {
+			selected = n
+		}
+		if trustYes.MatchString(t) {
+			yes = n
+		}
+		n++
+	}
+	if selected < 0 || yes < 0 {
+		return nil, true
+	}
+	var keys []string
+	for i := selected; i < yes; i++ {
+		keys = append(keys, keyDown)
+	}
+	for i := selected; i > yes; i-- {
+		keys = append(keys, keyUp)
+	}
+	return append(keys, keyEnter), true
+}
 
 // Command writes the MCP config and the hooks settings (0600, in the session dir) and builds the claude command line.
 func (Claude) Command(l Launch) (Command, error) {
@@ -129,7 +196,7 @@ func (Claude) Command(l Launch) (Command, error) {
 			l.Prompt,
 		},
 		TTY:       true,
-		Answers:   []Answer{{Match: claudeTrust, Input: "\r"}},
+		Answers:   []Answer{{Match: claudeTrust, Respond: claudeTrustKeys}},
 		IdleFiles: true,
 		ExitInput: "/exit\r",
 	}, nil
