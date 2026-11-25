@@ -1,28 +1,101 @@
 name: Release
 
+# Every merge to main that brings a releasable change publishes a release, so install.sh's
+# releases/latest/download always has the archives.
+# - push to main: scripts/next-version.sh picks the next version from the Conventional Commits since the last v* tag
+#   (feat = minor, fix/perf/revert = patch, ! or BREAKING CHANGE = major; v0.1.0 when there is no tag yet), tags the
+#   commit and releases it. Only build/chore/ci/docs/refactor/style/test commits, or an already tagged commit: no release.
+# - push of a v* tag: releases that tag (to pick a version by hand).
+# - workflow_dispatch: same as a push to main, for the current head of main.
+# A tag pushed with GITHUB_TOKEN does not start other workflows, so the tag and the release happen in this one job.
+
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Pick the tag
+        id: tag
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --force --tags origin
+          next="$(scripts/next-version.sh HEAD)"
+          if [ -z "$next" ]; then
+            echo "Nothing to release: HEAD is already tagged, or the commits since the last tag are only build/chore/ci/docs/refactor/style/test."
+            exit 0
+          fi
+          echo "Releasing $next"
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+          echo "new=true" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@v5
+        if: steps.tag.outputs.tag != ''
         with:
           go-version-file: go.mod
-      - run: go test ./...
+      - if: steps.tag.outputs.tag != ''
+        run: go test ./...
       - name: shellcheck install.sh
+        if: steps.tag.outputs.tag != ''
         run: shellcheck install.sh
+      - name: Tag the commit
+        if: steps.tag.outputs.new == 'true'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "collie-agent $TAG"
+          git push origin "$TAG"
       - uses: goreleaser/goreleaser-action@v6
+        if: steps.tag.outputs.tag != ''
         with:
           version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Installs the release just published with the installer people use, on Linux (amd64, arm64) and macOS (arm64).
+  smoke:
+    needs: release
+    if: needs.release.outputs.tag != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh from the release
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+          COLLIE_AGENT_INSTALL_DIR: ${{ runner.temp }}/bin
+        run: |
+          curl -fsSL "https://github.com/collies-ai/collie-agent/releases/download/$TAG/install.sh" \
+            | COLLIE_AGENT_VERSION="$TAG" sh
+          "$COLLIE_AGENT_INSTALL_DIR/collie-agent" version | grep -F "$TAG"
+      - name: releases/latest points at it
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+          COLLIE_AGENT_INSTALL_DIR: ${{ runner.temp }}/latest
+        run: |
+          sh install.sh
+          "$COLLIE_AGENT_INSTALL_DIR/collie-agent" version | grep -F "$TAG"
