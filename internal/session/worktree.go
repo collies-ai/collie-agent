@@ -91,17 +91,27 @@ func addWorktree(ctx context.Context, repo, dir, branch string) error {
 	if err := write(worktreeMeta{Repo: repo}); err != nil {
 		return err
 	}
-	if _, err := git(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
+	if branchExists(ctx, repo, branch) {
 		return fmt.Errorf("branch %s already exists in %s: collie-agent does not reuse or delete it", branch, repo)
 	}
 	base, err := defaultBase(ctx, repo)
 	if err != nil {
 		return err
 	}
-	if _, err := git(ctx, repo, "worktree", "add", "-b", branch, dir, base); err != nil {
-		return err
+	_, addErr := git(ctx, repo, "worktree", "add", "-b", branch, dir, base)
+	// git can fail after it created the branch (a post-checkout hook that exits nonzero): the branch did not exist a
+	// moment ago, so if it exists now this session created it and owns its cleanup.
+	if addErr == nil || branchExists(ctx, repo, branch) {
+		if err := write(worktreeMeta{Repo: repo, Branch: branch}); err != nil && addErr == nil {
+			return err
+		}
 	}
-	return write(worktreeMeta{Repo: repo, Branch: branch})
+	return addErr
+}
+
+func branchExists(ctx context.Context, repo, branch string) bool {
+	_, err := git(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+	return err == nil
 }
 
 // removeWorktree removes the worktree and its local branch (whatever the agent pushed stays on the remote), and the

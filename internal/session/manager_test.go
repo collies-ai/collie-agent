@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -102,6 +103,10 @@ if [ "$name" = claude ]; then
   touch "$sdir/activity"
   printf 'Remote Control \033]8;;https://claude.ai/code/session_01TESTabc-_9\033\\/rc active\033]8;;\033\\\n'
   if [ -n "$FAKE_IDLE" ]; then
+    if [ -n "$FAKE_LATE_TRUST" ]; then
+      echo "The model wrote: Do you trust the files in this folder?"
+      echo "1. Yes, proceed"
+    fi
     touch "$sdir/idle"
     read -r cmd
     echo "$cmd" > "$out/typed"
@@ -112,6 +117,10 @@ else
   echo '{"type":"thread.started","thread_id":"t1"}'
   echo '{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":200,"output_tokens":300}}'
   echo 'not json'
+  if [ -n "$FAKE_HUGE" ]; then
+    printf '{"type":"item.completed","text":"'; head -c 1200000 /dev/zero | tr '\0' x; printf '"}\n'
+    echo '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}'
+  fi
   echo '{"type":"turn.completed","usage":{"input_tokens":800,"cached_input_tokens":100,"output_tokens":50}}'
 fi
 if [ -n "$FAKE_BIG" ]; then head -c 300000 /dev/zero | tr '\0' x; echo; touch "$out/wrote"; fi
@@ -755,5 +764,80 @@ func TestClaudeHooksTouchTheIdleFiles(t *testing.T) {
 	}
 	if fi, _ := os.Stat(filepath.Join(dir, "settings.json")); fi.Mode().Perm() != 0o600 {
 		t.Errorf("settings.json mode %o", fi.Mode().Perm())
+	}
+}
+
+// R2: dialogs are answered only while the agent starts up; the same words later get no input.
+func TestATrustLineAfterStartupGetsNoInput(t *testing.T) {
+	m, _, repo, out := env(t)
+	t.Setenv("FAKE_IDLE", "1")
+	t.Setenv("FAKE_LATE_TRUST", "1")
+	m.IdleTimeout = 200 * time.Millisecond
+	m.IdlePoll = 20 * time.Millisecond
+	run(t, m, session(81, "claude", repo, "auto"))
+	if got := read(t, filepath.Join(out, "claude", "typed")); got != "/exit" {
+		t.Errorf("the agent read %q first: something was typed for the late trust line", got)
+	}
+}
+
+func TestOnlyTheTrustQuestionIsAnswered(t *testing.T) {
+	for _, line := range []string{"1. Yes, proceed", "Do you want to proceed?", "trust this folder", "Bash command: rm -rf x — Yes, proceed"} {
+		if claudeTrust.MatchString(line) {
+			t.Errorf("%q is taken for the trust dialog", line)
+		}
+	}
+	if !claudeTrust.MatchString("│ Do you trust the files in this folder? │") {
+		t.Error("the trust question is not recognized")
+	}
+}
+
+// R2: a record over the line limit is skipped and the scan goes on.
+func TestAnOversizedRecordDoesNotLoseTheUsageAfterIt(t *testing.T) {
+	m, api, repo, _ := env(t)
+	t.Setenv("FAKE_HUGE", "1")
+	run(t, m, session(82, "codex", repo, "auto"))
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.usage) != 1 || api.usage[0] == nil || api.usage[0].InputTokens != 1710 || api.usage[0].OutputTokens != 355 {
+		t.Errorf("usage = %+v, want the turn after the oversized record counted", api.usage)
+	}
+}
+
+func TestLineSplitter(t *testing.T) {
+	in := "a\r\nb\n" + strings.Repeat("x", 100) + "\nc\n" + strings.Repeat("y", 100)
+	sc := bufio.NewScanner(strings.NewReader(in))
+	sc.Buffer(make([]byte, 16), 33)
+	sc.Split(lineSplitter(32))
+	var got []string
+	for sc.Scan() {
+		got = append(got, sc.Text())
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != "a,,b,c" {
+		t.Errorf("lines = %q", got)
+	}
+}
+
+// R2: when git fails after it created the branch (a failing post-checkout hook), the session still owns and deletes
+// it, and the same session can run again.
+func TestABranchCreatedByAFailedWorktreeAddIsCleanedUp(t *testing.T) {
+	m, api, repo, out := env(t)
+	hook := filepath.Join(repo, ".git", "hooks", "post-checkout")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, m, session(83, "claude", repo, "auto"))
+	if _, finished := api.snapshot(); len(finished) != 1 || finished[0] != -1 {
+		t.Fatalf("finished = %v, want -1 for a failed worktree", finished)
+	}
+	if b := gitRun(t, repo, "branch", "--list", "collie/session-83"); b != "" {
+		t.Errorf("the branch the failed add created is still there: %q", b)
+	}
+	_ = os.Remove(hook)
+	run(t, m, session(83, "claude", repo, "auto"))
+	if got := read(t, filepath.Join(out, "claude", "branch")); got != "collie/session-83" {
+		t.Errorf("the retry ran on %q", got)
 	}
 }

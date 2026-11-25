@@ -295,8 +295,8 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 		defer close(scanned)
 		answered := make([]bool, len(spec.Answers))
 		sc := bufio.NewScanner(out)
-		sc.Buffer(make([]byte, 64*1024), 1<<20)
-		sc.Split(splitLines)
+		sc.Buffer(make([]byte, 64*1024), maxLine+1)
+		sc.Split(lineSplitter(maxLine))
 		for sc.Scan() {
 			lastOutput.Store(time.Now().UnixNano())
 			raw := sc.Text()
@@ -312,7 +312,7 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 				emit("started", func(c context.Context) error { return m.API.SessionStarted(c, s.ID, url) })
 			}
 			for i, ans := range spec.Answers {
-				if !answered[i] && tty != nil && ans.Match.MatchString(text) {
+				if !answered[i] && tty != nil && m.startingUp(dir, started) && ans.Match.MatchString(text) {
 					answered[i] = true
 					_, _ = tty.WriteString(ans.Input)
 				}
@@ -373,6 +373,12 @@ loop:
 	return exitCode(cmd, waitErr), obs.Usage, nil
 }
 
+// startingUp reports whether the agent is still starting: it did no work yet (its hooks never marked activity) and
+// it started less than StartupWindow ago. Only then are startup dialogs answered.
+func (m *Manager) startingUp(dir string, started time.Time) bool {
+	return time.Since(started) < StartupWindow && mtime(filepath.Join(dir, ActivityFile)).IsZero()
+}
+
 func (m *Manager) idleTimeout() time.Duration {
 	if m.IdleTimeout > 0 {
 		return m.IdleTimeout
@@ -420,15 +426,31 @@ func (m *Manager) end(cmd *exec.Cmd, tty *os.File, input string, waited <-chan e
 	return errors.New("stopped")
 }
 
-// splitLines splits output on \n or \r: a terminal program redraws lines with \r.
-func splitLines(data []byte, atEOF bool) (int, []byte, error) {
-	if i := bytes.IndexAny(data, "\r\n"); i >= 0 {
-		return i + 1, data[:i], nil
+// maxLine is the longest line of output read whole; a longer one is skipped up to its end.
+const maxLine = 1 << 20
+
+// lineSplitter splits output on \n or \r (a terminal program redraws lines with \r). A line longer than max is
+// dropped and reading resumes after its end, so one huge record never stops the scan.
+func lineSplitter(max int) bufio.SplitFunc {
+	skipping := false
+	return func(data []byte, atEOF bool) (int, []byte, error) {
+		i := bytes.IndexAny(data, "\r\n")
+		switch {
+		case i >= 0 && skipping:
+			skipping = false
+			return i + 1, nil, nil // the tail of a dropped line
+		case i >= 0:
+			return i + 1, data[:i], nil
+		case len(data) >= max:
+			skipping = true
+			return len(data), nil, nil
+		case atEOF && len(data) > 0 && !skipping:
+			return len(data), data, nil
+		case atEOF:
+			return len(data), nil, nil
+		}
+		return 0, nil, nil
 	}
-	if atEOF && len(data) > 0 {
-		return len(data), data, nil
-	}
-	return 0, nil, nil
 }
 
 // escapes are terminal control sequences: CSI (colors, cursor moves), OSC (titles, hyperlinks) and single-character

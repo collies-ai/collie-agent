@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/collies-ai/collie-agent/internal/machine"
 )
@@ -31,7 +32,8 @@ type Command struct {
 	Env    []string // added to the environment
 	// TTY runs the agent in a pseudo-terminal: for an interactive CLI.
 	TTY bool
-	// Answers are typed into the terminal the first time a line of output matches (TTY only).
+	// Answers are typed into the terminal when a startup dialog shows (TTY only): once each, and only while the agent
+	// is starting, before it did any work (no activity file) and within StartupWindow.
 	Answers []Answer
 	// IdleFiles says the agent touches ActivityFile and IdleFile in the session dir (through its hooks): the manager
 	// ends it once it has been idle for the idle timeout, typing ExitInput first (TTY only).
@@ -39,7 +41,11 @@ type Command struct {
 	ExitInput string
 }
 
-// Answer is input typed into an interactive agent when a line of its output (without escape codes) matches.
+// StartupWindow is how long after the start a startup dialog is still answered.
+const StartupWindow = 2 * time.Minute
+
+// Answer is input typed into an interactive agent when a line of its output (without escape codes) matches, while
+// it starts up.
 type Answer struct {
 	Match *regexp.Regexp
 	Input string
@@ -89,9 +95,10 @@ func (Claude) Binary() string { return "claude" }
 // prompt, plan only plans. Anything else is auto.
 var claudePermission = map[string]string{"auto": "acceptEdits", "full": "bypassPermissions", "plan": "plan"}
 
-// claudeTrust matches the workspace trust dialog a new folder shows. The worktree is a checkout of a repo the person
-// bound inside their root folders, so collie-agent accepts it (Enter on "Yes, proceed").
-var claudeTrust = regexp.MustCompile(`(?i)do you trust|trust (the files in )?this folder|yes, proceed`)
+// claudeTrust matches the question of the workspace trust dialog a new folder shows, and nothing else: an option
+// label such as "Yes, proceed" also appears in other dialogs. The worktree is a checkout of a repo the person bound
+// inside their root folders, so collie-agent accepts it (Enter on the default "Yes, proceed").
+var claudeTrust = regexp.MustCompile(`(?i)do you trust the files in this folder\?`)
 
 // Command writes the MCP config and the hooks settings (0600, in the session dir) and builds the claude command line.
 func (Claude) Command(l Launch) (Command, error) {
