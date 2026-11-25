@@ -266,6 +266,7 @@ func (r *Runner) heartbeatLoop(ctx context.Context, bound chan struct{}) error {
 			OS:             runtime.GOOS + "/" + runtime.GOARCH,
 			MaxConcurrency: r.maxConcurrency(),
 			Agents:         r.agents,
+			RootsCount:     len(r.settings().RootFolders),
 		}
 		if r.dispatcher != nil {
 			hb.Running = r.dispatcher.Running()

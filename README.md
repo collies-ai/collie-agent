@@ -210,8 +210,10 @@ collie-agent talks to collie over HTTPS:
   `POST /oauth/token` with `grant_type=urn:ietf:params:oauth:grant-type:device_code` until collie answers
   `{machine_id, machine_token}`. It waits `interval` seconds between polls and 5 more after every `slow_down`.
 - `POST /machine/v1/heartbeat` with `Authorization: Bearer <machine_token>` and
-  `{version, os, max_concurrency, agents, running}` every 30 seconds (backing off up to 5 minutes on errors). A 401
-  means the machine was revoked or its token is invalid.
+  `{version, os, max_concurrency, agents, running, roots_count}` every 30 seconds (backing off up to 5 minutes on
+  errors). `roots_count` is the number of root folders configured, always sent (0 when there are none), so collie can
+  tell a machine with no roots from one whose roots hold no matching repo. A 401 means the machine was revoked or its
+  token is invalid.
 - `GET /machine/v1/codebases`, `PUT /machine/v1/inventory {repos: [{codebase_id, path}]}`, `GET /machine/v1/bindings`.
 - `wss://<server>/cable` (bearer token, `Origin: <server>`, `MachineChannel`), with `GET /machine/v1/dispatches?wait=25`
   as the fallback, and `POST /machine/v1/dispatches/:id/ack {accepted, reason}`.
