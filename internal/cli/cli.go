@@ -383,9 +383,19 @@ func (a *App) status(p config.Profile, args []string) int {
 	}
 	if st != nil {
 		for _, b := range st.Bindings {
-			line := fmt.Sprintf("Binding:     #%d %s/%s in %s", b.RunnerID, b.Project, b.Codebase, b.Folder)
+			line := fmt.Sprintf("Binding:     #%d %s/%s", b.RunnerID, b.Project, b.Codebase)
+			if b.Purpose != "" {
+				line += " " + b.Purpose
+			}
+			line += " in " + b.Folder
 			if b.Pinned {
 				line += " (pinned)"
+			}
+			if b.PermissionMode != "" {
+				line += fmt.Sprintf(", permissions %s", b.PermissionMode)
+				if b.PermissionFrom != "" && b.PermissionFrom != "collie" {
+					line += " from the " + b.PermissionFrom
+				}
 			}
 			if b.Refused != "" {
 				line += " — refused: " + b.Refused

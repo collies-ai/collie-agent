@@ -1030,3 +1030,40 @@ func TestAStopAfterTheBranchIsCreatedDoesNotOrphanIt(t *testing.T) {
 		t.Errorf("the branch created before the stop is orphaned: %q", b)
 	}
 }
+
+const claudeHelp = `Options:
+  --permission-mode <mode>              Permission mode to use for the session
+                                        (choices: "acceptEdits", "auto",
+                                        "bypassPermissions", "manual",
+                                        "dontAsk", "plan")
+  --plugin-dir <path>                   Load plugins from a directory`
+
+func TestParseClaudeModes(t *testing.T) {
+	if got := strings.Join(parseClaudeModes(claudeHelp), ","); got != "acceptEdits,auto,bypassPermissions,manual,dontAsk,plan" {
+		t.Errorf("modes = %q", got)
+	}
+	if got := parseClaudeModes("Usage: claude [options]"); got != nil {
+		t.Errorf("modes without the flag = %q", got)
+	}
+}
+
+func TestClaudeRunsInItsAutoModeWhenItHasOne(t *testing.T) {
+	orig := claudeModes
+	t.Cleanup(func() { claudeModes = orig })
+	for _, c := range []struct {
+		modes      []string
+		mode, want string
+	}{
+		{[]string{"acceptEdits", "auto", "plan"}, "auto", "auto"},
+		{[]string{"acceptEdits", "auto", "plan"}, "", "auto"},
+		{[]string{"acceptEdits", "bypassPermissions", "plan"}, "auto", "acceptEdits"},
+		{nil, "auto", "acceptEdits"},
+		{nil, "full", "bypassPermissions"},
+		{nil, "plan", "plan"},
+	} {
+		claudeModes = func(string) []string { return c.modes }
+		if got := claudeMode(c.mode, "/bin/claude"); got != c.want {
+			t.Errorf("mode %q with %q: %q, want %q", c.mode, c.modes, got, c.want)
+		}
+	}
+}

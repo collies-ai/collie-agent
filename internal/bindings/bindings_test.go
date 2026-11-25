@@ -158,3 +158,29 @@ func TestARootRedirectedDuringTheCheckDoesNotMoveTheBoundary(t *testing.T) {
 		t.Errorf("the root was resolved %d times during one check, want 1", rootCalls)
 	}
 }
+
+func TestTheMachinesPermissionModeOverridesCollieAndAPinOverridesIt(t *testing.T) {
+	root := realDir(t)
+	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
+	_ = os.MkdirAll(a, 0o755)
+	_ = os.MkdirAll(b, 0o755)
+	server := []machine.Binding{
+		{RunnerID: 1, Project: "p", Codebase: "a", Folder: a, PermissionMode: "auto"},
+		{RunnerID: 2, Project: "p", Codebase: "b", Folder: b, PermissionMode: "full"},
+	}
+
+	got := Resolve(server, &config.Settings{RootFolders: []string{root}})
+	if got[0].PermissionMode != "auto" || got[0].PermissionFrom != "collie" || got[1].PermissionMode != "full" {
+		t.Errorf("without local settings: %+v", got)
+	}
+
+	s := &config.Settings{RootFolders: []string{root}, PermissionMode: "plan",
+		Bindings: []config.PinnedBinding{{RunnerID: 2, PermissionMode: "auto"}}}
+	got = Resolve(server, s)
+	if got[0].PermissionMode != "plan" || got[0].PermissionFrom != "machine" {
+		t.Errorf("the machine's mode did not override collie's: %+v", got[0])
+	}
+	if got[1].PermissionMode != "auto" || got[1].PermissionFrom != "pin" {
+		t.Errorf("the pin did not override the machine's mode: %+v", got[1])
+	}
+}
