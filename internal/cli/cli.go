@@ -23,6 +23,7 @@ import (
 	"github.com/collies-ai/collie-agent/internal/machine"
 	"github.com/collies-ai/collie-agent/internal/pairing"
 	"github.com/collies-ai/collie-agent/internal/service"
+	"github.com/collies-ai/collie-agent/internal/session"
 	"github.com/collies-ai/collie-agent/internal/version"
 )
 
@@ -314,6 +315,13 @@ func (a *App) run(p config.Profile, args []string) int {
 	if remote, ok := api.(agent.Remote); ok {
 		r.Remote = remote
 		r.Cable = &cable.Client{Server: creds.Server, Token: creds.MachineToken, UserAgent: ua}
+	}
+	if sapi, ok := api.(session.API); ok {
+		max := settings.MaxConcurrency
+		if max <= 0 {
+			max = agent.DefaultMaxConcurrency
+		}
+		r.Sessions = &session.Manager{API: sapi, Dir: filepath.Join(p.Dir, "sessions"), Log: logger, MaxConcurrency: max}
 	}
 	logger.Printf("collie-agent %s running as machine #%s with %s (profile %q, %d root folders)", version.Version, creds.MachineID, creds.Server, p.Name, len(settings.RootFolders))
 	if err := r.Loop(a.ctx()); err != nil {

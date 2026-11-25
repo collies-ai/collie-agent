@@ -172,6 +172,15 @@ func (r *Runner) Loop(ctx context.Context) error {
 	}
 	r.dispatcher = &dispatch.Dispatcher{API: r.Remote, Sessions: sessions, Log: r.logger(), MaxConcurrency: r.maxConcurrency()}
 
+	// Sessions that keep files on disk sweep what a crash left behind before taking new work, and the runner waits
+	// for running sessions to be stopped and cleaned up before it returns.
+	if sw, ok := sessions.(interface{ Sweep(context.Context) }); ok {
+		sw.Sweep(ctx)
+	}
+	if w, ok := sessions.(interface{ Wait() }); ok {
+		defer w.Wait()
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	fatal := make(chan error, 1)

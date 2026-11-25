@@ -6,9 +6,8 @@ opening ports.
 
 It runs as one background service per OS user: it holds the machine's pairing and its outbound connection to collie.
 
-> Status: this version installs, pairs, keeps the machine online, reports the repos it finds, syncs its bindings and
-> receives dispatches from collie. Running agent sessions comes next: until then every dispatch is declined with that
-> reason, so collie gives the work to another runner.
+> Status: this version installs, pairs, keeps the machine online, reports the repos it finds, syncs its bindings,
+> receives dispatches from collie and runs them as Claude Code or Codex sessions in their own git worktree.
 
 ## Install
 
@@ -92,7 +91,22 @@ instead.
 - **Dispatches.** It holds a cable connection to collie (`wss://<server>/cable`, `MachineChannel`) and reconnects
   with backoff; while the cable is down it long-polls `GET /machine/v1/dispatches`. Each offer is only a job
   reference. collie-agent accepts it when the binding is usable and there is room (machine-wide and per binding), and
-  declines it with a reason otherwise.
+  declines it with a reason otherwise (also when the binding's agent CLI is not installed).
+- **Sessions.** An accepted dispatch runs as one agent session:
+  - a git worktree of the bound repo in `<profile dir>/sessions/<id>/worktree`, on a new branch
+    `collie/session-<id>` from the remote's default branch (`origin/HEAD`, else `HEAD`);
+  - the agent CLI runs there, in its own process group, with collie's runner prompt for the binding's purpose
+    (worker, `qa-browser` or `reviewer`) and the job reference appended in `<routine-fire-payload>`;
+  - it reaches collie's MCP server with a short-lived session token (1 hour, renewed 10 minutes before it expires)
+    passed only in the `COLLIE_SESSION_TOKEN` environment variable: Claude Code gets an MCP config that references
+    the variable, Codex `bearer_token_env_var`;
+  - the binding's permission mode maps to Claude Code / Codex as `auto` → `acceptEdits` / `workspace-write`,
+    `full` → `bypassPermissions` / `danger-full-access` and `plan` → `plan` / `read-only` (anything else is `auto`);
+  - Claude Code runs with `--remote-control`, and the session URL it prints is reported to collie;
+  - output goes to `<profile dir>/sessions/<id>/agent.log`. When the agent exits (or the token is revoked, or the
+    service stops, which kills it) collie-agent reports the exit code and removes the worktree and its branch.
+    Leftover worktrees from a crash are removed when `run` starts.
+  - The agent runs as your OS user, with your access: bind only repos you trust collie's work in.
 - A 401 anywhere means the machine was revoked: everything stops.
 
 ### Local config
@@ -129,7 +143,7 @@ shellcheck install.sh
 Layout: `cmd/collie-agent` (entry point) and `internal/`: `cli` (commands), `pairing` (device flow), `config`
 (profiles, credentials, settings, state), `machine` (the `/machine/v1` API client), `discovery` (agent CLIs, repo
 scan, remote matching), `bindings` (local overrides and the root-folder check), `cable` (ActionCable client),
-`dispatch` (capacity and acks), `agent` (`run`: heartbeat, inventory, bindings sync, connection, single-instance
+`dispatch` (capacity and acks), `session` (worktrees, the Claude Code and Codex adapters, prompts, token renewal), `agent` (`run`: heartbeat, inventory, bindings sync, connection, single-instance
 lock), `service` (launchd and systemd), `browser`, `version`.
 
 The tests run the device flow and the heartbeat against fake collie servers, and render the launchd plist and the
@@ -158,6 +172,8 @@ collie-agent talks to collie over HTTPS:
 - `GET /machine/v1/codebases`, `PUT /machine/v1/inventory {repos: [{codebase_id, path}]}`, `GET /machine/v1/bindings`.
 - `wss://<server>/cable` (bearer token, `Origin: <server>`, `MachineChannel`), with `GET /machine/v1/dispatches?wait=25`
   as the fallback, and `POST /machine/v1/dispatches/:id/ack {accepted, reason}`.
+- `POST /machine/v1/sessions/:id/token` (renew; 409 means the session is gone) and
+  `POST /machine/v1/sessions/:id/events` (`started` with the session URL, `finished` with the exit code).
 
 The full contract is in collie's docs.
 

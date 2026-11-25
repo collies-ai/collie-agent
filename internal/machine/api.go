@@ -48,12 +48,34 @@ type Dispatch struct {
 	RunnerID    int64           `json:"runner_id"`
 	Kind        string          `json:"kind"`
 	Purpose     string          `json:"purpose"`
-	Reference   string          `json:"reference"`
+	Reference   Ref             `json:"reference"`
 	Payload     json.RawMessage `json:"payload,omitempty"`
 	Project     string          `json:"project"`
 	Codebase    string          `json:"codebase"`
 	MCPURL      string          `json:"mcp_url"`
 	AckDeadline time.Time       `json:"ack_deadline"`
+}
+
+// Ref is a dispatch's reference: collie sends it as a number (a goal or task id), older or hand-made messages as a
+// string. Both decode.
+type Ref string
+
+// UnmarshalJSON accepts a JSON number or string.
+func (r *Ref) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		*r = Ref(s)
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err != nil {
+		return fmt.Errorf("reference must be a number or a string: %w", err)
+	}
+	*r = Ref(n.String())
+	return nil
 }
 
 // Accepted is collie's answer to an accepted offer.
@@ -134,4 +156,62 @@ func (c *Client) Ack(ctx context.Context, dispatchID int64, accept bool, reason 
 		return nil, nil
 	}
 	return &out, nil
+}
+
+// Usage is an agent session's cumulative usage, as collie charges it on the finished event.
+type Usage struct {
+	SessionID                string `json:"session_id,omitempty"`
+	Model                    string `json:"model,omitempty"`
+	InputTokens              int64  `json:"input_tokens"`
+	CacheCreationInputTokens int64  `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64  `json:"cache_read_input_tokens"`
+	OutputTokens             int64  `json:"output_tokens"`
+	Billing                  string `json:"billing,omitempty"`
+}
+
+// ErrRetry means collie could not record a session event; send it again.
+var ErrRetry = errors.New("collie could not record the event; send it again")
+
+// RenewSessionToken pushes the session token's expiry. The token itself does not change. ErrGone means the session
+// ended or its token already expired.
+func (c *Client) RenewSessionToken(ctx context.Context, sessionID int64) (time.Time, error) {
+	var out struct {
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	err := c.do(ctx, http.MethodPost, fmt.Sprintf("/machine/v1/sessions/%d/token", sessionID), map[string]any{}, &out)
+	if err != nil {
+		return time.Time{}, sessionError(err)
+	}
+	return out.ExpiresAt, nil
+}
+
+// SessionStarted reports that the agent process started, with the link to watch it when there is one.
+func (c *Client) SessionStarted(ctx context.Context, sessionID int64, sessionURL string) error {
+	body := map[string]any{"event": "started"}
+	if sessionURL != "" {
+		body["session_url"] = sessionURL
+	}
+	return sessionError(c.do(ctx, http.MethodPost, fmt.Sprintf("/machine/v1/sessions/%d/events", sessionID), body, nil))
+}
+
+// SessionFinished reports that the agent process ended, with its exit code and, when known, its usage.
+func (c *Client) SessionFinished(ctx context.Context, sessionID int64, exitCode int, usage *Usage) error {
+	body := map[string]any{"event": "finished", "exit_code": exitCode}
+	if usage != nil {
+		body["usage"] = usage
+	}
+	return sessionError(c.do(ctx, http.MethodPost, fmt.Sprintf("/machine/v1/sessions/%d/events", sessionID), body, nil))
+}
+
+func sessionError(err error) error {
+	var se *StatusError
+	if errors.As(err, &se) {
+		switch se.Status {
+		case http.StatusConflict, http.StatusNotFound:
+			return fmt.Errorf("%w: %s", ErrGone, se.Body)
+		case http.StatusServiceUnavailable:
+			return ErrRetry
+		}
+	}
+	return err
 }
