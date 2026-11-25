@@ -167,19 +167,21 @@ func claudeProjectDir(path string) string {
 
 // codexFolders reads ~/.codex/config.toml: the [projects."<path>"] tables whose trust_level is "trusted". It is not
 // a full TOML parser, but it tracks where a statement can start (outside strings, multiline strings and arrays), so
-// text inside a value is never read as a table or a key. Nothing is trusted until the whole file has been read: a file
-// it cannot read unambiguously (including a project table or a trust_level defined twice, which TOML forbids) trusts
-// nothing.
+// text inside a value is never read as a table or a key, and it compares keys and table names decoded (a quoted and a
+// bare spelling are the same key, as in TOML). Nothing is trusted until the whole file has been read, and a file it
+// cannot read unambiguously trusts nothing: a table or a trust_level defined twice (which TOML forbids), a key it
+// cannot decode, an array of tables under projects, or a project's trust set any other way (a dotted key or an inline
+// table).
 func codexFolders(home string) []Folder {
 	b, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
 	if err != nil {
 		return nil
 	}
 	var sc tomlScanner
-	seenTables := map[string]bool{} // every table header, so a project table defined twice is caught
+	seenTables := map[string]bool{} // decoded table paths, so a table defined twice is caught
 	trust := map[string]string{}    // project path -> its trust_level
 	var order []string
-	current, inProject := "", false
+	var table []string // the decoded path of the current table
 	for _, raw := range strings.Split(string(b), "\n") {
 		line := strings.TrimSuffix(raw, "\r")
 		if !sc.atStatement() {
@@ -192,34 +194,53 @@ func codexFolders(home string) []Folder {
 		switch {
 		case trimmed == "" || strings.HasPrefix(trimmed, "#"):
 			continue
-		case strings.HasPrefix(trimmed, "["):
-			if !sc.scan(line) || !sc.atStatement() {
-				return nil // a header never spans lines
-			}
-			current = codexProjectHeader(trimmed)
-			inProject = current != ""
-			if inProject {
-				if seenTables[current] {
-					return nil
-				}
-				seenTables[current] = true
-				order = append(order, current)
-			}
-			continue
-		}
-		key, value, found := strings.Cut(trimmed, "=")
-		if !found {
-			return nil
-		}
-		if inProject && strings.TrimSpace(key) == "trust_level" {
-			if _, dup := trust[current]; dup {
+		case strings.HasPrefix(trimmed, "[["):
+			path, ok := tomlHeader(trimmed[2:], "]]")
+			if !ok || (len(path) > 0 && path[0] == "projects") || !sc.scan(line) || !sc.atStatement() {
 				return nil
 			}
-			v, ok := tomlString(strings.TrimSpace(value))
-			if !ok {
-				v = "" // present but not a plain string: not trusted, and still counts for duplicates
+			table = path
+			continue
+		case strings.HasPrefix(trimmed, "["):
+			path, ok := tomlHeader(trimmed[1:], "]")
+			if !ok || !sc.scan(line) || !sc.atStatement() {
+				return nil // a header never spans lines
 			}
-			trust[current] = v
+			id := strings.Join(path, "\x00")
+			if seenTables[id] {
+				return nil
+			}
+			seenTables[id] = true
+			if len(path) > 2 && path[0] == "projects" {
+				return nil // a sub-table of a project: not a shape Codex writes
+			}
+			if len(path) == 2 && path[0] == "projects" {
+				order = append(order, path[1])
+			}
+			table = path
+			continue
+		}
+		key, rest, ok := tomlKeyPath(trimmed)
+		if !ok || !strings.HasPrefix(rest, "=") {
+			return nil
+		}
+		full := append(append([]string{}, table...), key...)
+		if len(full) > 0 && full[0] == "projects" {
+			switch {
+			case len(full) == 3 && full[2] == "trust_level" && len(table) == 2:
+				p := full[1]
+				if _, dup := trust[p]; dup {
+					return nil
+				}
+				v, ok := tomlString(strings.TrimSpace(rest[1:]))
+				if !ok {
+					v = "" // present but not a plain string: not trusted, and still counts for duplicates
+				}
+				trust[p] = v
+			case len(full) <= 3:
+				// projects = ..., projects."<p>" = {...} or a dotted projects."<p>".trust_level: trust set another way.
+				return nil
+			}
 		}
 		if !sc.scan(line) {
 			return nil
@@ -235,6 +256,64 @@ func codexFolders(home string) []Folder {
 		}
 	}
 	return out
+}
+
+// tomlHeader decodes the key path of a table header whose opening bracket was already read, up to closing; only a
+// comment may follow.
+func tomlHeader(s, closing string) ([]string, bool) {
+	path, rest, ok := tomlKeyPath(s)
+	if !ok {
+		return nil, false
+	}
+	rest, ok = strings.CutPrefix(rest, closing)
+	if !ok || !onlyComment(rest) {
+		return nil, false
+	}
+	return path, true
+}
+
+// tomlKeyPath decodes a TOML key (bare, "basic" or 'literal' parts joined by dots, spaces allowed around them) at the
+// start of s and returns its parts and the rest of s after the key and the spaces that follow it.
+func tomlKeyPath(s string) ([]string, string, bool) {
+	var parts []string
+	for {
+		s = strings.TrimLeft(s, " \t")
+		var part string
+		switch {
+		case strings.HasPrefix(s, `"`):
+			end := closingQuote(s[1:], '"')
+			if end < 0 {
+				return nil, "", false
+			}
+			v, err := strconv.Unquote(s[:end+2])
+			if err != nil {
+				return nil, "", false
+			}
+			part, s = v, s[end+2:]
+		case strings.HasPrefix(s, "'"):
+			end := strings.IndexByte(s[1:], '\'')
+			if end < 0 {
+				return nil, "", false
+			}
+			part, s = s[1:end+1], s[end+2:]
+		default:
+			n := 0
+			for n < len(s) && (s[n] >= 'a' && s[n] <= 'z' || s[n] >= 'A' && s[n] <= 'Z' || s[n] >= '0' && s[n] <= '9' || s[n] == '_' || s[n] == '-') {
+				n++
+			}
+			if n == 0 {
+				return nil, "", false
+			}
+			part, s = s[:n], s[n:]
+		}
+		parts = append(parts, part)
+		s = strings.TrimLeft(s, " \t")
+		rest, more := strings.CutPrefix(s, ".")
+		if !more {
+			return parts, s, true
+		}
+		s = rest
+	}
 }
 
 // tomlScanner follows TOML values across lines: whether the next line is inside a multiline string or an array, or
@@ -318,36 +397,6 @@ func closingQuote(s string, quote byte) int {
 		}
 	}
 	return -1
-}
-
-// codexProjectHeader returns the path of a [projects."<path>"] (or [projects.'<path>']) table header, or "".
-func codexProjectHeader(line string) string {
-	if strings.HasPrefix(line, "[[") {
-		return ""
-	}
-	inner, ok := strings.CutPrefix(line, "[")
-	if !ok {
-		return ""
-	}
-	if i := strings.LastIndex(inner, "]"); i >= 0 {
-		inner = inner[:i]
-	} else {
-		return ""
-	}
-	inner = strings.TrimSpace(inner)
-	rest, ok := strings.CutPrefix(inner, "projects")
-	if !ok {
-		return ""
-	}
-	rest, ok = strings.CutPrefix(strings.TrimSpace(rest), ".")
-	if !ok {
-		return ""
-	}
-	path, ok := tomlString(strings.TrimSpace(rest))
-	if !ok {
-		return ""
-	}
-	return path
 }
 
 // tomlString reads a TOML basic ("...") or literal ('...') string that makes up the whole value, a trailing comment
