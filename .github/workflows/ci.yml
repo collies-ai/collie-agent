@@ -14,8 +14,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS runs the launchd tests against plutil, Linux the systemd ones against systemd-analyze.
-        os: [ubuntu-latest, macos-latest]
+        # Linux runs the systemd tests against systemd-analyze and checks the launchd plist in Go. macOS (slow to get
+        # a runner) only runs on pushes to main, where it also lints the plist with plutil; PRs do not wait for it.
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -50,9 +51,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: shellcheck install.sh
-        run: shellcheck install.sh
+      - name: shellcheck install.sh and scripts
+        run: shellcheck install.sh scripts/*.sh
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
           args: check
+      # Builds the release archives without publishing, and checks they are the names install.sh downloads.
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean
+      - name: Release archives match install.sh
+        run: |
+          for target in darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+            archive="collie-agent_${target}.tar.gz"
+            test -f "dist/$archive"
+            grep -q " $archive\$" dist/checksums.txt
+            tar -tzf "dist/$archive" | grep -qx collie-agent
+          done
+
+  # The release version comes from the commit types (scripts/next-version.sh), so every commit of a PR must be one.
+  conventional-commits:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Conventional Commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: scripts/check-commits.sh "$BASE" "$HEAD"

@@ -1,15 +1,37 @@
 name: Release
 
+# Every merge to main that brings a releasable change publishes a release, so install.sh's
+# releases/latest/download always has the archives. scripts/release.sh does the work:
+# - push to main, or a manual run on main: every commit since the last v* tag with a releasable change gets its own
+#   tag, with the version scripts/next-version.sh picks from its Conventional Commits (feat = minor,
+#   fix/perf/revert = patch, ! or BREAKING CHANGE = major; v0.1.0 when there is no tag yet). Only
+#   build/chore/ci/docs/refactor/style/test commits: no tag.
+# - push of a v* tag: picks a version by hand (git tag v1.0.0 && git push origin v1.0.0).
+# Either way, every v* tag without a complete release is then published, so a run that failed, was canceled or was
+# dropped from the queue is finished by the next one (GitHub keeps one pending run per concurrency group and
+# replaces it when another arrives).
+# A tag pushed with GITHUB_TOKEN does not start other workflows, so tagging and publishing happen in this one job.
+
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
+    # A manual run publishes main only, never another branch or a tag picked in the run form.
+    if: github.event_name == 'push' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      latest: ${{ steps.release.outputs.latest }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,11 +40,50 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go test ./...
-      - name: shellcheck install.sh
-        run: shellcheck install.sh
+      - name: shellcheck
+        run: shellcheck install.sh scripts/*.sh
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
-          args: release --clean
+          install-only: true
+      - name: Tag and publish
+        id: release
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_COMMITS: ${{ github.ref_type == 'branch' }}
+          PUBLISHED_FILE: ${{ runner.temp }}/published
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          scripts/release.sh
+          if [ -s "$PUBLISHED_FILE" ]; then
+            echo "latest=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Installs the latest release with the installer people use, on Linux (amd64, arm64) and macOS (arm64).
+  smoke:
+    needs: release
+    if: needs.release.outputs.latest != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh from the release
+        env:
+          TAG: ${{ needs.release.outputs.latest }}
+          COLLIE_AGENT_INSTALL_DIR: ${{ runner.temp }}/bin
+        run: |
+          curl -fsSL "https://github.com/collies-ai/collie-agent/releases/download/$TAG/install.sh" \
+            | COLLIE_AGENT_VERSION="$TAG" sh
+          "$COLLIE_AGENT_INSTALL_DIR/collie-agent" version | grep -F "$TAG"
+      - name: releases/latest points at it
+        env:
+          TAG: ${{ needs.release.outputs.latest }}
+          COLLIE_AGENT_INSTALL_DIR: ${{ runner.temp }}/latest
+        run: |
+          sh install.sh
+          "$COLLIE_AGENT_INSTALL_DIR/collie-agent" version | grep -F "$TAG"

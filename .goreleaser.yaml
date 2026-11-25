@@ -1,4 +1,4 @@
-# Built by .github/workflows/release.yml when a v* tag is pushed.
+# Built by scripts/release.sh, run by .github/workflows/release.yml.
 version: 2
 
 project_name: collie-agent
@@ -29,9 +29,31 @@ checksum:
   algorithm: sha256
 
 release:
+  # scripts/release.sh sets MAKE_LATEST: only the highest version is the latest release, even when an older tag is
+  # published after it. A rerun replaces what a failed run left in the release.
+  make_latest: "{{ .Env.MAKE_LATEST }}"
+  replace_existing_draft: true
+  replace_existing_artifacts: true
   extra_files:
     - glob: ./install.sh
 
 changelog:
   use: github
   sort: asc
+  # Commits follow Conventional Commits (scripts/check-commits.sh); merge commits are left out.
+  filters:
+    exclude:
+      - "^Merge pull request"
+      - "^Merge branch"
+  groups:
+    - title: Breaking changes
+      regexp: '^.*?[a-z]+(\([^)]+\))?!:.+$'
+      order: 0
+    - title: Features
+      regexp: '^.*?feat(\([^)]+\))?:.+$'
+      order: 1
+    - title: Fixes
+      regexp: '^.*?(fix|perf|revert)(\([^)]+\))?:.+$'
+      order: 2
+    - title: Other
+      order: 999

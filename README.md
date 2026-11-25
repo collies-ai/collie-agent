@@ -148,7 +148,7 @@ Go 1.24 or newer:
 go build ./cmd/collie-agent
 go vet ./...
 go test -race ./...
-shellcheck install.sh
+shellcheck install.sh scripts/*.sh
 ```
 
 Layout: `cmd/collie-agent` (entry point) and `internal/`: `cli` (commands), `pairing` (device flow), `config`
@@ -160,14 +160,32 @@ lock), `service` (launchd and systemd), `browser`, `version`.
 The tests run the device flow and the heartbeat against fake collie servers, and render the launchd plist and the
 systemd unit (checked with `plutil -lint` on macOS and `systemd-analyze verify` on Linux when available).
 
-### Release
+### Commits and releases
 
-Push a `v*` tag. `.github/workflows/release.yml` runs the tests and [GoReleaser](https://goreleaser.com)
-(`.goreleaser.yaml`), which publishes `collie-agent_<os>_<arch>.tar.gz` for darwin and linux on amd64 and arm64,
-`checksums.txt` and `install.sh` to the GitHub release.
+Commits follow [Conventional Commits](https://www.conventionalcommits.org): `<type>[(scope)][!]: <description>`,
+with type `feat`, `fix`, `perf`, `revert`, `build`, `chore`, `ci`, `docs`, `refactor`, `style` or `test`. CI checks
+every commit of a pull request (`scripts/check-commits.sh`).
+
+Every merge to `main` releases by itself. `.github/workflows/release.yml` runs `scripts/release.sh`, which tags
+every commit on `main` since the last `v*` tag that brings a releasable change, each with the version
+`scripts/next-version.sh` picks from the commits it adds:
+
+| Commits since the last tag | Release |
+| --- | --- |
+| a `!` after the type, or a `BREAKING CHANGE:` footer | major (minor while the version is `0.x`) |
+| `feat` | minor |
+| `fix`, `perf`, `revert` | patch |
+| only `build`, `chore`, `ci`, `docs`, `refactor`, `style`, `test` | none |
+
+Then it publishes, with [GoReleaser](https://goreleaser.com) (`.goreleaser.yaml`), every `v*` tag whose release is
+missing or incomplete: `collie-agent_<os>_<arch>.tar.gz` for darwin and linux on amd64 and arm64, `checksums.txt` and
+`install.sh`, with a changelog grouped by type. A release run that failed, was canceled or was dropped from the queue
+is therefore finished by the next run (or by running the workflow by hand on `main`). Only the highest version is
+marked latest. Finally it installs that release with `install.sh` on Linux and macOS. The first release is `v0.1.0`.
+To pick a version by hand, push the tag yourself:
 
 ```sh
-git tag v0.1.0 && git push origin v0.1.0
+git tag v1.0.0 && git push origin v1.0.0
 ```
 
 ## Protocol
