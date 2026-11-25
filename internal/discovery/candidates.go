@@ -167,15 +167,19 @@ func claudeProjectDir(path string) string {
 
 // codexFolders reads ~/.codex/config.toml: the [projects."<path>"] tables whose trust_level is "trusted". It is not
 // a full TOML parser, but it tracks where a statement can start (outside strings, multiline strings and arrays), so
-// text inside a value is never read as a table or a key. When the file cannot be read unambiguously it trusts nothing.
+// text inside a value is never read as a table or a key. Nothing is trusted until the whole file has been read: a file
+// it cannot read unambiguously (including a project table or a trust_level defined twice, which TOML forbids) trusts
+// nothing.
 func codexFolders(home string) []Folder {
 	b, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
 	if err != nil {
 		return nil
 	}
-	var out []Folder
 	var sc tomlScanner
-	current := "" // the project path of the table being read
+	seenTables := map[string]bool{} // every table header, so a project table defined twice is caught
+	trust := map[string]string{}    // project path -> its trust_level
+	var order []string
+	current, inProject := "", false
 	for _, raw := range strings.Split(string(b), "\n") {
 		line := strings.TrimSuffix(raw, "\r")
 		if !sc.atStatement() {
@@ -189,9 +193,17 @@ func codexFolders(home string) []Folder {
 		case trimmed == "" || strings.HasPrefix(trimmed, "#"):
 			continue
 		case strings.HasPrefix(trimmed, "["):
-			current = codexProjectHeader(trimmed)
 			if !sc.scan(line) || !sc.atStatement() {
 				return nil // a header never spans lines
+			}
+			current = codexProjectHeader(trimmed)
+			inProject = current != ""
+			if inProject {
+				if seenTables[current] {
+					return nil
+				}
+				seenTables[current] = true
+				order = append(order, current)
 			}
 			continue
 		}
@@ -199,11 +211,15 @@ func codexFolders(home string) []Folder {
 		if !found {
 			return nil
 		}
-		if current != "" && strings.TrimSpace(key) == "trust_level" {
-			if v, ok := tomlString(strings.TrimSpace(value)); ok && v == "trusted" && usable(current) {
-				out = append(out, Folder{Path: filepath.Clean(current), Source: SourceCodex})
-				current = "" // one entry per table
+		if inProject && strings.TrimSpace(key) == "trust_level" {
+			if _, dup := trust[current]; dup {
+				return nil
 			}
+			v, ok := tomlString(strings.TrimSpace(value))
+			if !ok {
+				v = "" // present but not a plain string: not trusted, and still counts for duplicates
+			}
+			trust[current] = v
 		}
 		if !sc.scan(line) {
 			return nil
@@ -211,6 +227,12 @@ func codexFolders(home string) []Folder {
 	}
 	if !sc.atStatement() {
 		return nil // a string or an array left open at the end of the file
+	}
+	var out []Folder
+	for _, p := range order {
+		if trust[p] == "trusted" && usable(p) {
+			out = append(out, Folder{Path: filepath.Clean(p), Source: SourceCodex})
+		}
 	}
 	return out
 }
