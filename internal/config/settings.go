@@ -17,6 +17,10 @@ const settingsFile = "config.json"
 type Settings struct {
 	// RootFolders are the only places collie-agent looks for repos and the only places a binding's folder may be.
 	RootFolders []string `json:"root_folders"`
+	// Discover lists where else repos are found, by the person's consent at pairing: "claude" (the folders Claude Code
+	// trusts) and "codex" (the projects Codex trusts). Those exact repo folders are then allowed like root folders,
+	// never their children. Absent (nil) means the person was never asked; an empty list means they said no.
+	Discover *[]string `json:"discover,omitempty"`
 	// MaxConcurrency is the machine-wide limit of sessions at once (0: the default).
 	MaxConcurrency int `json:"max_concurrency,omitempty"`
 	// PermissionMode, when set, is the permission mode of every binding on this machine, whatever collie says: auto,
@@ -38,6 +42,36 @@ type PinnedBinding struct {
 	PermissionMode string            `json:"permission_mode,omitempty"`
 	MaxConcurrency int               `json:"max_concurrency,omitempty"`
 	Disabled       bool              `json:"disabled,omitempty"`
+}
+
+// DiscoverSources are the sources Discover accepts.
+var DiscoverSources = []string{"claude", "codex"}
+
+// DiscoverFrom returns the discovery sources the person allowed (none when never asked or answered no).
+func (s *Settings) DiscoverFrom() []string {
+	if s == nil || s.Discover == nil {
+		return nil
+	}
+	return *s.Discover
+}
+
+// ParseDiscover reads a --discover value: a comma-separated list of DiscoverSources, or "none".
+func ParseDiscover(v string) ([]string, error) {
+	v = strings.TrimSpace(v)
+	if v == "none" {
+		return []string{}, nil
+	}
+	out := []string{}
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if !slices.Contains(DiscoverSources, part) {
+			return nil, fmt.Errorf("discover %q is not one of %s, or none", part, strings.Join(DiscoverSources, ", "))
+		}
+		if !slices.Contains(out, part) {
+			out = append(out, part)
+		}
+	}
+	return out, nil
 }
 
 // PermissionModes are the modes a binding can run in: auto (the agent works on its own inside the worktree and asks
@@ -75,6 +109,11 @@ func (p Profile) LoadSettings() (*Settings, error) {
 	for _, b := range s.Bindings {
 		if !validPermissionMode(b.PermissionMode) {
 			return nil, fmt.Errorf("%s: binding permission_mode %q is not one of %s", p.SettingsPath(), b.PermissionMode, strings.Join(PermissionModes, ", "))
+		}
+	}
+	for _, d := range s.DiscoverFrom() {
+		if !slices.Contains(DiscoverSources, d) {
+			return nil, fmt.Errorf("%s: discover %q is not one of %s", p.SettingsPath(), d, strings.Join(DiscoverSources, ", "))
 		}
 	}
 	roots := make([]string, 0, len(s.RootFolders))

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -391,5 +392,116 @@ func TestRootsAddListRemove(t *testing.T) {
 	}
 	if code := h.run("roots", "bogus"); code != exitUsage {
 		t.Errorf("bogus = %d", code)
+	}
+}
+
+// discoverIn reads the discover key of the default profile's config.json: (nil, false) when absent.
+func discoverIn(t *testing.T, h *harness) ([]string, bool) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(h.base, "collie-agent", "config.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	v, ok := raw["discover"]
+	if !ok {
+		return nil, false
+	}
+	var out []string
+	if err := json.Unmarshal(v, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out, true
+}
+
+func TestPairAsksAboutDiscovery(t *testing.T) {
+	cases := []struct {
+		input string
+		want  []string
+	}{
+		{"\n", []string{"claude", "codex"}},
+		{"y\n", []string{"claude", "codex"}},
+		{"Yes\n", []string{"claude", "codex"}},
+		{"", []string{"claude", "codex"}}, // EOF counts as Enter
+		{"n\n", []string{}},
+		{"no\n", []string{}},
+	}
+	for _, c := range cases {
+		h := newHarness(t, "linux")
+		srv := collieServer(t, nil)
+		h.app.Stdin = strings.NewReader(c.input)
+		h.app.IsTerminal = func() bool { return true }
+		if code := h.run("pair", "--server", srv.URL); code != 0 {
+			t.Fatalf("pair = %d: %s", code, h.err)
+		}
+		if !strings.Contains(h.out.String(), "Use the repos you already opened with Claude Code or Codex? [Y/n]") {
+			t.Errorf("%q: not asked:\n%s", c.input, h.out)
+		}
+		got, ok := discoverIn(t, h)
+		if !ok || !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%q: discover = %v (set %v), want %v", c.input, got, ok, c.want)
+		}
+	}
+}
+
+func TestPairWithoutATerminalAsksNothing(t *testing.T) {
+	h := newHarness(t, "linux")
+	srv := collieServer(t, nil)
+	h.app.Stdin = strings.NewReader("y\n")
+	h.app.IsTerminal = func() bool { return false }
+	if code := h.run("pair", "--server", srv.URL); code != 0 {
+		t.Fatalf("pair = %d: %s", code, h.err)
+	}
+	if strings.Contains(h.out.String(), "[Y/n]") {
+		t.Errorf("asked without a terminal:\n%s", h.out)
+	}
+	if got, ok := discoverIn(t, h); ok {
+		t.Errorf("discover written without a terminal: %v", got)
+	}
+}
+
+func TestPairDiscoverFlagAndForceKeepsTheAnswer(t *testing.T) {
+	h := newHarness(t, "linux")
+	srv := collieServer(t, nil)
+	h.app.IsTerminal = func() bool { return true }
+	h.app.Stdin = strings.NewReader("y\n")
+	if code := h.run("pair", "--server", srv.URL, "--discover", "claude"); code != 0 {
+		t.Fatalf("pair = %d: %s", code, h.err)
+	}
+	if strings.Contains(h.out.String(), "[Y/n]") {
+		t.Errorf("asked although --discover was given:\n%s", h.out)
+	}
+	if got, _ := discoverIn(t, h); !reflect.DeepEqual(got, []string{"claude"}) {
+		t.Errorf("discover = %v", got)
+	}
+
+	// pair --force does not ask again and keeps the earlier answer.
+	h.app.Stdin = strings.NewReader("n\n")
+	if code := h.run("pair", "--server", srv.URL, "--force"); code != 0 {
+		t.Fatalf("pair --force = %d: %s", code, h.err)
+	}
+	if strings.Contains(h.out.String(), "[Y/n]") {
+		t.Errorf("asked again on --force:\n%s", h.out)
+	}
+	if got, _ := discoverIn(t, h); !reflect.DeepEqual(got, []string{"claude"}) {
+		t.Errorf("discover after --force = %v", got)
+	}
+
+	// An explicit --discover changes it.
+	if code := h.run("pair", "--server", srv.URL, "--force", "--discover=none"); code != 0 {
+		t.Fatalf("pair --discover=none = %d: %s", code, h.err)
+	}
+	if got, ok := discoverIn(t, h); !ok || len(got) != 0 {
+		t.Errorf("discover after none = %v (set %v)", got, ok)
+	}
+	if code := h.run("status"); code != 0 || !strings.Contains(h.out.String(), "Discovery:   off") {
+		t.Errorf("status = %d:\n%s", code, h.out)
+	}
+
+	if code := h.run("pair", "--server", srv.URL, "--force", "--discover", "gitlab"); code != exitUsage {
+		t.Errorf("--discover gitlab = %d", code)
 	}
 }

@@ -1,5 +1,6 @@
 // Package bindings turns collie's bindings into the ones this machine actually serves. The machine has the last word:
-// pinned bindings in the local config override collie's, and a folder outside the root folders is always refused.
+// pinned bindings in the local config override collie's, and a folder outside the allowed folders (inside a root folder,
+// or exactly a discovered repo) is always refused.
 package bindings
 
 import (
@@ -7,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/collies-ai/collie-agent/internal/config"
@@ -28,10 +30,19 @@ type Binding struct {
 // Usable reports whether dispatches for this binding may be accepted.
 func (b Binding) Usable() bool { return b.Refused == "" }
 
+// Allowed is where a binding's folder may be: inside one of the Roots (the root folders), or exactly one of the Exact
+// folders (repos discovered from Claude Code or Codex, never their children).
+type Allowed struct {
+	Roots []string
+	Exact []string
+}
+
+func (a Allowed) empty() bool { return len(a.Roots) == 0 && len(a.Exact) == 0 }
+
 // Resolve applies the local settings to collie's bindings: the machine's permission mode overrides collie's, pinned
-// fields override both, and every folder is checked against the root folders. Pins that match no binding from collie are ignored: without a runner_id from
-// collie there is nothing to dispatch.
-func Resolve(server []machine.Binding, s *config.Settings) []Binding {
+// fields override both, and every folder is checked against the allowed folders. Pins that match no binding from
+// collie are ignored: without a runner_id from collie there is nothing to dispatch.
+func Resolve(server []machine.Binding, s *config.Settings, allowed Allowed) []Binding {
 	if s == nil {
 		s = &config.Settings{}
 	}
@@ -51,7 +62,7 @@ func Resolve(server []machine.Binding, s *config.Settings) []Binding {
 			}
 		}
 		if b.Refused == "" {
-			if folder, err := Within(b.Folder, s.RootFolders); err != nil {
+			if folder, err := Within(b.Folder, allowed); err != nil {
 				b.Refused = err.Error()
 			} else {
 				b.Folder = folder
@@ -109,30 +120,43 @@ func apply(b *Binding, p *config.PinnedBinding) {
 	}
 }
 
-// ErrNoRoots means no root folders are configured, so no folder can be allowed.
-var ErrNoRoots = errors.New("no root folders configured (collie-agent roots add <folder>)")
+// ErrNoRoots means no folder can be allowed: no root folders are configured and no repo was discovered.
+var ErrNoRoots = errors.New("no root folders configured (collie-agent roots add <folder>) and no discovered repos")
 
 // Within returns folder resolved (absolute, symlinks followed) when it is an existing directory inside one of the
-// root folders, and an error otherwise. Symlinks are resolved on both sides, so a link inside a root cannot point
-// the agent outside it.
-func Within(folder string, roots []string) (string, error) {
-	if len(roots) == 0 {
+// root folders or exactly one of the exact folders, and an error otherwise. Symlinks are resolved on both sides, so a
+// link inside a root cannot point the agent outside it.
+func Within(folder string, allowed Allowed) (string, error) {
+	if allowed.empty() {
 		return "", ErrNoRoots
 	}
 	real, err := resolveFolder(folder)
 	if err != nil {
 		return "", err
 	}
-	resolved := make([]string, 0, len(roots))
-	for _, root := range roots {
-		if r, err := evalSymlinks(filepath.Clean(root)); err == nil {
-			resolved = append(resolved, r)
-		}
-	}
-	if !inside(real, resolved) {
-		return "", fmt.Errorf("folder %q is outside the root folders", folder)
+	if !inside(real, resolveAll(allowed.Roots)) && !slices.Contains(resolveAll(allowed.Exact), real) {
+		return "", outside(folder, len(allowed.Exact) > 0)
 	}
 	return real, nil
+}
+
+// outside is the refusal of a folder that is not allowed.
+func outside(folder string, withExact bool) error {
+	if withExact {
+		return fmt.Errorf("folder %q is outside the root folders and is not a discovered repo", folder)
+	}
+	return fmt.Errorf("folder %q is outside the root folders", folder)
+}
+
+// resolveAll resolves the symlinks of every path, leaving out those that do not resolve.
+func resolveAll(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if r, err := evalSymlinks(filepath.Clean(p)); err == nil {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // evalSymlinks is filepath.EvalSymlinks; tests replace it to redirect a path between two checks.
@@ -178,16 +202,27 @@ func copyMap(m map[string]string) map[string]string {
 	return out
 }
 
-// Root is a root folder and where it resolved (symlinks followed) when the bindings were synced.
+// Root is an allowed folder (a root folder or an exact one) and where it resolved (symlinks followed) when the
+// bindings were synced.
 type Root struct {
 	Path     string
 	Resolved string
 }
 
-// PinRoots resolves the root folders now. Roots that do not resolve are left out.
-func PinRoots(roots []string) []Root {
-	out := make([]Root, 0, len(roots))
-	for _, r := range roots {
+// Pinned is Allowed resolved at sync time.
+type Pinned struct {
+	Roots []Root
+	Exact []Root
+}
+
+// PinRoots resolves the allowed folders now. Folders that do not resolve are left out.
+func PinRoots(allowed Allowed) Pinned {
+	return Pinned{Roots: pin(allowed.Roots), Exact: pin(allowed.Exact)}
+}
+
+func pin(paths []string) []Root {
+	out := make([]Root, 0, len(paths))
+	for _, r := range paths {
 		if res, err := evalSymlinks(filepath.Clean(r)); err == nil {
 			out = append(out, Root{Path: r, Resolved: res})
 		}
@@ -195,11 +230,9 @@ func PinRoots(roots []string) []Root {
 	return out
 }
 
-// WithinPinned is Within against roots pinned at sync time: a root (or an ancestor of it) that now resolves
-// somewhere else was redirected and no longer counts, so a swap of the root itself cannot move the boundary.
-func WithinPinned(folder string, roots []Root) (string, error) {
-	var still []string
-	redirected := false
+// stillPinned returns the resolved targets of the folders that still resolve where they did when pinned; redirected
+// says some no longer do.
+func stillPinned(roots []Root) (still []string, redirected bool) {
 	for _, r := range roots {
 		res, err := evalSymlinks(filepath.Clean(r.Path))
 		if err != nil || res != r.Resolved {
@@ -208,8 +241,19 @@ func WithinPinned(folder string, roots []Root) (string, error) {
 		}
 		still = append(still, r.Resolved)
 	}
-	if len(still) == 0 {
-		if redirected {
+	return still, redirected
+}
+
+// WithinPinned is Within against folders pinned at sync time: a folder (or an ancestor of it) that now resolves
+// somewhere else was redirected and no longer counts, so a swap of the folder itself cannot move the boundary.
+func WithinPinned(folder string, pinned Pinned) (string, error) {
+	roots, rootsMoved := stillPinned(pinned.Roots)
+	exact, exactMoved := stillPinned(pinned.Exact)
+	if len(roots) == 0 && len(exact) == 0 {
+		if exactMoved {
+			return "", errors.New("the root folders or the discovered repos changed since the bindings were synced")
+		}
+		if rootsMoved {
 			return "", errors.New("the root folders changed since the bindings were synced")
 		}
 		return "", ErrNoRoots
@@ -218,10 +262,10 @@ func WithinPinned(folder string, roots []Root) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Compare against the targets pinned at sync, never against the roots resolved again: a redirect after the
+	// Compare against the targets pinned at sync, never against the folders resolved again: a redirect after the
 	// check above cannot move the boundary.
-	if !inside(real, still) {
-		return "", fmt.Errorf("folder %q is outside the root folders", folder)
+	if !inside(real, roots) && !slices.Contains(exact, real) {
+		return "", outside(folder, len(pinned.Exact) > 0)
 	}
 	return real, nil
 }

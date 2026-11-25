@@ -30,6 +30,8 @@ type Repo struct {
 	Remotes  []Remote // as written in the repo's git config, in file order
 	Worktree bool     // Path is a linked worktree, not a main checkout
 	Branch   string   // the checked-out branch ("" when detached or unknown)
+	// Source is where the repo was found: SourceRoot, SourceClaude, SourceCodex or SourceScan ("" when not set).
+	Source string
 	// LastUsed is when the person last worked in the repo (zero when unknown). Matching ranks recently used clones
 	// first.
 	LastUsed time.Time

@@ -85,7 +85,7 @@ func setBindings(t *testing.T, d *Dispatcher, bs []bindings.Binding) string {
 			}
 		}
 	}
-	d.SetBindings(bs, []string{root})
+	d.SetBindings(bs, bindings.Allowed{Roots: []string{root}})
 	return root
 }
 
@@ -320,7 +320,7 @@ func TestARedirectedRootNoLongerCounts(t *testing.T) {
 			sess := &fakeSessions{}
 			d := &Dispatcher{API: api, Sessions: sess, MaxConcurrency: 4}
 			b := binding(1, folder, 4)
-			d.SetBindings([]bindings.Binding{b}, []string{root})
+			d.SetBindings([]bindings.Binding{b}, bindings.Allowed{Roots: []string{root}})
 
 			_ = d.Handle(context.Background(), offer(1, 1))
 			if len(sess.started) != 1 {
@@ -406,5 +406,71 @@ func TestReviewsAreNotHeldByTheMachineWideLimit(t *testing.T) {
 	}
 	if r := api.acks[4].Reason; !strings.Contains(r, "binding at capacity (3 of 3") {
 		t.Errorf("the review over its binding's limit was declined with %q", r)
+	}
+}
+
+func TestExactFoldersAreAcceptedButNotTheirChildren(t *testing.T) {
+	api := &fakeAPI{}
+	d := &Dispatcher{API: api, Sessions: &fakeSessions{}, MaxConcurrency: 5}
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(base, "collie")
+	child := filepath.Join(repo, "sub")
+	other := filepath.Join(base, "other")
+	for _, dir := range []string{child, other} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d.SetBindings([]bindings.Binding{binding(1, repo, 1), binding(2, child, 1), binding(3, other, 1)},
+		bindings.Allowed{Exact: []string{repo}})
+	ctx := context.Background()
+	for i := int64(1); i <= 3; i++ {
+		_ = d.Handle(ctx, offer(i, i))
+	}
+	if !api.acks[0].Accept {
+		t.Errorf("exact folder declined: %+v", api.acks[0])
+	}
+	for _, a := range api.acks[1:] {
+		if a.Accept || !strings.Contains(a.Reason, "not a discovered repo") {
+			t.Errorf("offer %d: %+v", a.DispatchID, a)
+		}
+	}
+
+	// Without exact folders (discovery off) the same repo is outside the roots.
+	api2 := &fakeAPI{}
+	d2 := &Dispatcher{API: api2, Sessions: &fakeSessions{}, MaxConcurrency: 5}
+	d2.SetBindings([]bindings.Binding{binding(1, repo, 1)}, bindings.Allowed{Roots: []string{other}})
+	_ = d2.Handle(ctx, offer(1, 1))
+	if api2.acks[0].Accept || !strings.Contains(api2.acks[0].Reason, "outside the root folders") {
+		t.Errorf("without discovery: %+v", api2.acks[0])
+	}
+}
+
+func TestASwappedExactFolderIsDeclined(t *testing.T) {
+	api := &fakeAPI{}
+	d := &Dispatcher{API: api, Sessions: &fakeSessions{}, MaxConcurrency: 5}
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	real1, evil := filepath.Join(base, "real"), filepath.Join(base, "evil")
+	_ = os.MkdirAll(real1, 0o755)
+	_ = os.MkdirAll(evil, 0o755)
+	link := filepath.Join(base, "collie")
+	if err := os.Symlink(real1, link); err != nil {
+		t.Fatal(err)
+	}
+	d.SetBindings([]bindings.Binding{binding(1, link, 1)}, bindings.Allowed{Exact: []string{link}})
+	// After the sync, the discovered folder is pointed somewhere else.
+	_ = os.Remove(link)
+	if err := os.Symlink(evil, link); err != nil {
+		t.Fatal(err)
+	}
+	_ = d.Handle(context.Background(), offer(1, 1))
+	if api.acks[0].Accept {
+		t.Errorf("accepted an offer into a swapped folder: %+v", api.acks[0])
 	}
 }
