@@ -91,7 +91,9 @@ instead.
 - **Dispatches.** It holds a cable connection to collie (`wss://<server>/cable`, `MachineChannel`) and reconnects
   with backoff; while the cable is down it long-polls `GET /machine/v1/dispatches`. Each offer is only a job
   reference. collie-agent accepts it when the binding is usable and there is room (machine-wide and per binding), and
-  declines it with a reason otherwise (also when the binding's agent CLI is not installed).
+  declines it with a reason otherwise (also when the binding's agent CLI is not installed). Reviews count only against
+  their binding's `max_concurrency`, not the machine's: builds waiting for their reviews never keep the reviews from
+  starting.
 - **Sessions.** An accepted dispatch runs as one agent session:
   - a git worktree of the bound repo in `<repo>/.claude/worktrees/collie-session-<id>` (where Claude Code's own
     `--worktree` puts them; collie-agent adds `/.claude/worktrees/` to the repo's `.git/info/exclude` when it is not
