@@ -374,7 +374,7 @@ func (r *Runner) reportInventory(ctx context.Context) error {
 	if scan == nil {
 		scan = discovery.ScanRepos
 	}
-	inv := discovery.Match(scan(r.settings().RootFolders), codebases)
+	inv := discovery.Inventory(discovery.Match(scan(r.settings().RootFolders), codebases))
 	if err := r.Remote.PutInventory(ctx, inv); err != nil {
 		return err
 	}
