@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -18,6 +19,9 @@ type Settings struct {
 	RootFolders []string `json:"root_folders"`
 	// MaxConcurrency is the machine-wide limit of sessions at once (0: the default).
 	MaxConcurrency int `json:"max_concurrency,omitempty"`
+	// PermissionMode, when set, is the permission mode of every binding on this machine, whatever collie says: auto,
+	// full or plan. A binding's pin can still set its own.
+	PermissionMode string `json:"permission_mode,omitempty"`
 	// Bindings pins or overrides collie's bindings, matched by runner_id or by project + codebase (+ purpose).
 	Bindings []PinnedBinding `json:"bindings,omitempty"`
 }
@@ -34,6 +38,16 @@ type PinnedBinding struct {
 	PermissionMode string            `json:"permission_mode,omitempty"`
 	MaxConcurrency int               `json:"max_concurrency,omitempty"`
 	Disabled       bool              `json:"disabled,omitempty"`
+}
+
+// PermissionModes are the modes a binding can run in: auto (the agent works on its own inside the worktree and asks
+// before anything risky), full (no prompts and no sandbox) and plan (read-only).
+var PermissionModes = []string{"auto", "full", "plan"}
+
+// validPermissionMode reports whether mode is empty (not set) or one of PermissionModes. A typo is an error rather
+// than a silent default: the local config is where the person narrows what agents may do.
+func validPermissionMode(mode string) bool {
+	return mode == "" || slices.Contains(PermissionModes, mode)
 }
 
 // SettingsPath is the profile's config.json.
@@ -54,6 +68,14 @@ func (p Profile) LoadSettings() (*Settings, error) {
 	}
 	if s.MaxConcurrency < 0 {
 		return nil, fmt.Errorf("%s: max_concurrency must not be negative", p.SettingsPath())
+	}
+	if !validPermissionMode(s.PermissionMode) {
+		return nil, fmt.Errorf("%s: permission_mode %q is not one of %s", p.SettingsPath(), s.PermissionMode, strings.Join(PermissionModes, ", "))
+	}
+	for _, b := range s.Bindings {
+		if !validPermissionMode(b.PermissionMode) {
+			return nil, fmt.Errorf("%s: binding permission_mode %q is not one of %s", p.SettingsPath(), b.PermissionMode, strings.Join(PermissionModes, ", "))
+		}
 	}
 	roots := make([]string, 0, len(s.RootFolders))
 	for _, r := range s.RootFolders {

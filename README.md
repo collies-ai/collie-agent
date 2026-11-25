@@ -105,8 +105,14 @@ instead.
   - it reaches collie's MCP server with a short-lived session token (1 hour, renewed 10 minutes before it expires)
     passed only in the `COLLIE_SESSION_TOKEN` environment variable: Claude Code gets an MCP config that references
     the variable, Codex `bearer_token_env_var`;
-  - the binding's permission mode maps to Claude Code / Codex as `auto` → `acceptEdits` / `workspace-write`,
-    `full` → `bypassPermissions` / `danger-full-access` and `plan` → `plan` / `read-only` (anything else is `auto`);
+  - the binding's permission mode (from collie, or from the local config: see below) maps to Claude Code / Codex as:
+
+    | Mode | Claude Code `--permission-mode` | Codex `--sandbox` |
+    | --- | --- | --- |
+    | `auto` (default) | `auto`: Claude decides what needs you and works on its own otherwise (`acceptEdits` on a Claude Code without auto mode, read from `claude --help`) | `workspace-write` |
+    | `full` | `bypassPermissions` | `danger-full-access` |
+    | `plan` | `plan` | `read-only` |
+
   - **Claude Code** runs as an interactive session with Remote Control (`claude --remote-control <name> <prompt>`) in
     a pseudo-terminal, so it shows in claude.ai/code and the Claude app, where you can watch it, answer its
     permission prompts or step in. Inside a repo you already trust in Claude Code the worktree asks nothing (trust
@@ -132,6 +138,7 @@ instead.
 {
   "root_folders": ["~/code"],
   "max_concurrency": 2,
+  "permission_mode": "auto",
   "bindings": [
     { "project": "collies", "codebase": "collie", "agents": { "code": "codex" }, "max_concurrency": 2 },
     { "runner_id": 12, "folder": "~/code/collie-agent", "permission_mode": "plan" },
@@ -140,8 +147,11 @@ instead.
 }
 ```
 
-A pin matches a binding from collie by `runner_id`, or by `project` + `codebase` (+ `purpose`), and replaces the
-fields it sets; `disabled` turns that binding off on this machine. A pinned folder must still be inside the root
+`permission_mode` (`auto`, `full` or `plan`) is the mode of every binding on this machine: when it is set, the mode
+chosen in collie is ignored. A pin matches a binding from collie by `runner_id`, or by `project` + `codebase`
+(+ `purpose`), and replaces the fields it sets, its `permission_mode` included (it wins over the machine's);
+`disabled` turns that binding off on this machine. An unknown permission mode is an error, never a silent default.
+`collie-agent status` shows each binding's mode and where it comes from. A pinned folder must still be inside the root
 folders. Restart the service after editing it.
 
 ## Develop

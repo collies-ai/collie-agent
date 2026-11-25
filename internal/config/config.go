@@ -210,8 +210,12 @@ type BindingState struct {
 	Project  string `json:"project"`
 	Codebase string `json:"codebase"`
 	Folder   string `json:"folder"`
+	Purpose  string `json:"purpose,omitempty"`
 	Pinned   bool   `json:"pinned,omitempty"`
 	Refused  string `json:"refused,omitempty"`
+	// PermissionMode is the mode the binding runs in, and PermissionFrom where it comes from (collie, machine, pin).
+	PermissionMode string `json:"permission_mode,omitempty"`
+	PermissionFrom string `json:"permission_from,omitempty"`
 }
 
 // LoadState reads the state; a missing file is an empty state.
