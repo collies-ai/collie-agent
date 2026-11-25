@@ -99,13 +99,14 @@ instead.
   Missing folders, temp dirs (`/tmp`, `/var/folders`) and worktrees (`*/.claude/worktrees/*`) are skipped, and repos
   without a remote are ignored. It then asks collie for the codebases of the projects granted to this machine, and
   reports only the repos whose remote matches one. A remote matches when it is a github.com repo with the codebase's `owner/name` (https, `ssh://` or `git@host:`
-  remotes; an SSH host alias counts when its `HostName` in `~/.ssh/config` is github.com): a gitlab.com remote with
-  the same `owner/name` does not. Every remote is read from `.git/config` without running git; `origin` wins, and a
+  remotes; for ssh remotes the host is resolved through `~/.ssh/config` as ssh does, so an alias whose `HostName` is
+  github.com counts and a `Host github.com` sent elsewhere does not): a gitlab.com remote with the same `owner/name`
+  does not. Every remote is read from `.git/config` without running git; `origin` wins, and a
   clone matched through another remote (the `upstream` of a fork) is reported as such. A folder inside a repo, or a
   linked worktree, counts as its main checkout, and symlinked paths to one clone count once (a worktree whose main
   checkout lies outside the root folders is left out). When a codebase has several clones, all are reported, the
-  preferred first: matched through `origin`, a main checkout over a worktree, the most recently used, then the one on
-  its default branch. It scans again every 10 minutes.
+  preferred first: a main checkout over a worktree, the most recently used, the one on its default branch, then one
+  matched through `origin` over one matched through another remote. It scans again every 10 minutes.
 - **Bindings.** In collie you bind a codebase found on this machine to an agent. collie-agent fetches the bindings
   whenever collie's `bindings_version` changes. **The machine has the last word**: a binding whose folder is outside
   the root folders (after resolving symlinks) is refused whatever collie says, unless discovery is on and the folder is

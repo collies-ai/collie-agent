@@ -44,13 +44,21 @@ func TestParseRemote(t *testing.T) {
 func TestGitHubRepoChecksTheHost(t *testing.T) {
 	cfg := filepath.Join(t.TempDir(), "ssh_config")
 	writeFile(t, cfg, `# work account
-Host github-work gh-*
+Host github-work
     HostName github.com
     IdentityFile ~/.ssh/work
+Host gh-* !gh-blocked
+  HostName %h.github.com.example
+Host gh-ok
+  HostName github.com
 Host=gitlab-alias
   HostName=gitlab.com
-Host *
+Host ghe
   HostName github.com
+Match host ghe
+  HostName git.internal
+Host *
+  User git
 `)
 	setSSHConfig(t, cfg)
 	h := newHostResolver()
@@ -59,7 +67,9 @@ Host *
 		"https://github.com/jfromaniello/collie":        "jfromaniello/collie",
 		"git@github-work:jfromaniello/collie.git":       "jfromaniello/collie", // alias resolving to github.com
 		"ssh://git@github-work/jfromaniello/collie.git": "jfromaniello/collie",
-		"git@gh-other:jfromaniello/collie.git":          "", // wildcard Host patterns are not aliases
+		"git@ghe:jfromaniello/collie.git":               "jfromaniello/collie", // Match blocks are ignored
+		"git@gh-ok:jfromaniello/collie.git":             "",                    // the earlier gh-* block wins
+		"git@gh-blocked:jfromaniello/collie.git":        "",                    // negated: falls through to no HostName
 		"git@gitlab-alias:jfromaniello/collie.git":      "",
 		"https://gitlab.com/jfromaniello/collie.git":    "",
 		"git@gitlab.com:jfromaniello/collie.git":        "",
@@ -71,6 +81,20 @@ Host *
 		if got := h.GitHubRepo(in); got != want {
 			t.Errorf("GitHubRepo(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestSSHHostNameOverridesALiteralGitHubHost(t *testing.T) {
+	cfg := filepath.Join(t.TempDir(), "ssh_config")
+	writeFile(t, cfg, "Host github.com\n  HostName git.internal.example\n")
+	setSSHConfig(t, cfg)
+	h := newHostResolver()
+	if got := h.GitHubRepo("git@github.com:jfromaniello/collie.git"); got != "" {
+		t.Errorf("ssh to github.com redirected elsewhere matched: %q", got)
+	}
+	// https does not go through ssh.
+	if got := h.GitHubRepo("https://github.com/jfromaniello/collie.git"); got != "jfromaniello/collie" {
+		t.Errorf("https = %q", got)
 	}
 }
 
@@ -160,6 +184,28 @@ func TestScanAndMatchReportsOnlyMatchingRepos(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("inventory = %+v\nwant %+v", got, want)
+	}
+}
+
+func TestCloneRankingIsNotOverriddenByTheRemote(t *testing.T) {
+	setSSHConfig(t, "")
+	now := time.Now()
+	origin := []Remote{{"origin", "git@github.com:jfromaniello/collie.git"}}
+	fork := []Remote{{"origin", "git@github.com:me/collie.git"}, {"upstream", "https://github.com/jfromaniello/collie"}}
+	repos := []Repo{
+		{Path: "/a/origin-worktree", Remotes: origin, Worktree: true, LastUsed: now},
+		{Path: "/a/origin-old", Remotes: origin, LastUsed: now.Add(-time.Hour)},
+		{Path: "/a/fork-main", Remotes: fork, LastUsed: now},
+		{Path: "/a/origin-same", Remotes: origin, LastUsed: now},
+	}
+	got := Match(repos, []machine.Codebase{{CodebaseID: 1, RepoFullName: "jfromaniello/collie"}})
+	var order []string
+	for _, c := range got[0].Candidates {
+		order = append(order, filepath.Base(c.Repo.Path))
+	}
+	// Main checkouts before the worktree, newer before older; at a tie, origin before upstream.
+	if want := []string{"origin-same", "fork-main", "origin-old", "origin-worktree"}; !reflect.DeepEqual(order, want) {
+		t.Errorf("ranking = %v, want %v", order, want)
 	}
 }
 
