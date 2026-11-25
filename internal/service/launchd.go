@@ -142,8 +142,26 @@ func (l *Launchd) Install(s Spec) error {
 		}
 		l.sleep(launchdBootstrapBackoff[attempt])
 	}
+	if launchdBusy(out, err) {
+		// Out of retries while launchd was still busy: wait for the old job once more and make a last attempt, so a
+		// teardown that just finished does not leave the agent unloaded.
+		l.waitUntilGone()
+		if out, err = l.Run("launchctl", "bootstrap", l.domain(), l.Path()); err == nil {
+			return nil
+		}
+	}
 	return fmt.Errorf("launchctl bootstrap: %v: %s\nThe agent is not loaded. Load it with: launchctl bootstrap %s %s",
-		err, out, l.domain(), l.Path())
+		err, out, l.domain(), shellQuote(l.Path()))
+}
+
+// shellQuote single-quotes s for a POSIX shell when it holds anything but safe characters.
+func shellQuote(s string) string {
+	if s != "" && strings.IndexFunc(s, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("/._-+:@,", r))
+	}) < 0 {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // waitUntilGone polls launchctl print until launchd no longer knows the label, for at most launchdBootoutTimeout.

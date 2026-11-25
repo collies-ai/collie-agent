@@ -707,3 +707,50 @@ func TestLaunchdInstallStopsWaitingForAStuckBootout(t *testing.T) {
 		t.Errorf("waited %v", total)
 	}
 }
+
+// When the retries run out while launchd is still busy, install waits for the old job once more and makes a last
+// attempt before giving up.
+func TestLaunchdInstallMakesALastAttemptAfterTheRetries(t *testing.T) {
+	p := profile(t, "")
+	l := &Launchd{Home: t.TempDir(), UID: 501, Profile: p}
+	bootstrap := "launchctl bootstrap gui/501 " + l.Path()
+	busy := step{launchdEIO, 5}
+	f := &fakeRun{seq: map[string][]step{
+		"launchctl print gui/501/sh.collies.collie-agent": {{launchdNotKnown, 113}},
+		bootstrap: {busy, busy, busy, busy, busy, {"", 0}},
+	}}
+	l.Run, l.Sleep = f.run, func(time.Duration) {}
+	if err := l.Install(spec(p)); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if n := count(f.calls, bootstrap); n != len(launchdBootstrapBackoff)+2 {
+		t.Errorf("bootstrap ran %d times, want %d", n, len(launchdBootstrapBackoff)+2)
+	}
+	last := f.calls[len(f.calls)-2]
+	if last != "launchctl print gui/501/sh.collies.collie-agent" {
+		t.Errorf("the last attempt did not wait for the old job first; call before it = %q", last)
+	}
+}
+
+// The command the error suggests can be pasted into a shell even when the home directory has spaces or quotes.
+func TestLaunchdInstallErrorQuotesThePlistPath(t *testing.T) {
+	p := profile(t, "")
+	home := filepath.Join(t.TempDir(), "Ana's Mac")
+	l := &Launchd{Home: home, UID: 501, Profile: p}
+	f := &fakeRun{seq: map[string][]step{
+		"launchctl print gui/501/sh.collies.collie-agent": {{launchdNotKnown, 113}},
+		"launchctl bootstrap gui/501 " + l.Path():         {{"Bootstrap failed: 1: Operation not permitted", 1}},
+	}}
+	l.Run, l.Sleep = f.run, func(time.Duration) {}
+	err := l.Install(spec(p))
+	if err == nil {
+		t.Fatal("install succeeded")
+	}
+	want := "launchctl bootstrap gui/501 '" + strings.ReplaceAll(l.Path(), "'", `'\''`) + "'"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not contain %q", err, want)
+	}
+	if got := shellQuote("/Users/ana/Library/LaunchAgents/sh.collies.collie-agent.plist"); got != "/Users/ana/Library/LaunchAgents/sh.collies.collie-agent.plist" {
+		t.Errorf("a safe path was quoted: %s", got)
+	}
+}
