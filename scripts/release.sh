@@ -44,7 +44,7 @@ if [ "${TAG_COMMITS:-false}" = true ]; then
   done
 fi
 
-complete() { # tag: the release exists, is published and has every asset
+release_complete() { # tag: the release exists, is published and has every asset
   names="$(gh release view "$1" --json isDraft,assets --jq 'select(.isDraft | not) | .assets[].name' 2>/dev/null)" || return 1
   for asset in $assets; do
     printf '%s\n' "$names" | grep -qxF "$asset" || return 1
@@ -54,7 +54,7 @@ complete() { # tag: the release exists, is published and has every asset
 latest="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
 start="$(git rev-parse HEAD)"
 for tag in $(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=v:refname | tail -n 20); do
-  if complete "$tag"; then
+  if release_complete "$tag"; then
     continue
   fi
   echo "Publishing $tag"
