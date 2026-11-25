@@ -82,7 +82,7 @@ func TestReceivesDispatches(t *testing.T) {
 	err := c.Run(ctx, func() { subscribed = true }, func(d machine.Dispatch) {
 		got = append(got, d)
 		cancel()
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("Run = %v", err)
 	}
@@ -97,7 +97,7 @@ func TestReceivesDispatches(t *testing.T) {
 func TestUnauthorized(t *testing.T) {
 	srv := server(t, func(ctx context.Context, c *websocket.Conn, ident string) {})
 	c := &Client{Server: srv.URL, Token: "wrong"}
-	if err := c.Run(context.Background(), nil, func(machine.Dispatch) {}); !errors.Is(err, ErrUnauthorized) {
+	if err := c.Run(context.Background(), nil, func(machine.Dispatch) {}, nil); !errors.Is(err, ErrUnauthorized) {
 		t.Errorf("bad token at the handshake: %v", err)
 	}
 
@@ -106,7 +106,7 @@ func TestUnauthorized(t *testing.T) {
 		<-ctx.Done()
 	})
 	c2 := &Client{Server: srv2.URL, Token: "tok"}
-	if err := c2.Run(context.Background(), nil, func(machine.Dispatch) {}); !errors.Is(err, ErrUnauthorized) {
+	if err := c2.Run(context.Background(), nil, func(machine.Dispatch) {}, nil); !errors.Is(err, ErrUnauthorized) {
 		t.Errorf("disconnect unauthorized: %v", err)
 	}
 }
@@ -115,7 +115,7 @@ func TestConnectionFailureIsAnError(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	defer srv.Close()
 	c := &Client{Server: srv.URL, Token: "tok"}
-	err := c.Run(context.Background(), nil, func(machine.Dispatch) {})
+	err := c.Run(context.Background(), nil, func(machine.Dispatch) {}, nil)
 	if err == nil || errors.Is(err, ErrUnauthorized) {
 		t.Errorf("err = %v", err)
 	}
@@ -131,5 +131,33 @@ func TestURL(t *testing.T) {
 	}
 	if o := (&Client{Server: "https://collies.sh/sub"}).Origin(); o != "https://collies.sh" {
 		t.Errorf("Origin = %q", o)
+	}
+}
+
+func TestCodebasesChangedCallsItsCallback(t *testing.T) {
+	srv := server(t, func(ctx context.Context, c *websocket.Conn, ident string) {
+		send(ctx, c, map[string]any{"identifier": ident, "message": map[string]any{"type": "codebases_changed", "codebases_version": 7}})
+		send(ctx, c, map[string]any{"identifier": `{"channel":"OtherChannel"}`, "message": map[string]any{"type": "codebases_changed", "codebases_version": 99}})
+		send(ctx, c, map[string]any{"identifier": ident, "message": map[string]any{"type": "codebases_changed"}})
+		send(ctx, c, map[string]any{"identifier": ident, "message": map[string]any{"type": "dispatch", "dispatch_id": 5, "session_id": 50}})
+		<-ctx.Done()
+	})
+	c := &Client{Server: srv.URL, Token: "tok"}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var versions []string
+	var got []machine.Dispatch
+	err := c.Run(ctx, nil, func(d machine.Dispatch) {
+		got = append(got, d)
+		cancel()
+	}, func(v string) { versions = append(versions, v) })
+	if err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	if len(versions) != 2 || versions[0] != "7" || versions[1] != "" {
+		t.Errorf("codebases_changed versions = %q", versions)
+	}
+	if len(got) != 1 || got[0].DispatchID != 5 {
+		t.Errorf("dispatches = %+v", got)
 	}
 }

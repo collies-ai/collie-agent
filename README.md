@@ -108,7 +108,11 @@ instead.
   linked worktree, counts as its main checkout, and symlinked paths to one clone count once (a worktree whose main
   checkout lies outside the root folders is left out). When a codebase has several clones, all are reported, the
   preferred first: a main checkout over a worktree, the most recently used, the one on its default branch, then one
-  matched through `origin` over one matched through another remote. It scans again every 10 minutes.
+  matched through `origin` over one matched through another remote. Each codebase is reported once: the chosen clone,
+  where it was found and the remote that matched, with the other clones as alternatives. It scans again every 10
+  minutes, and right away when collie says the codebases changed (a project enabled for this machine, a codebase added
+  or its repo changed): over the cable (`codebases_changed`), or through a newer `codebases_version` in the heartbeat
+  answer while the cable is down. A burst of changes makes one rescan.
 - **Bindings.** In collie you bind a codebase found on this machine to an agent. collie-agent fetches the bindings
   whenever collie's `bindings_version` changes. **The machine has the last word**: a binding whose folder is outside
   the root folders (after resolving symlinks) is refused whatever collie says, unless discovery is on and the folder is
@@ -244,9 +248,13 @@ collie-agent talks to collie over HTTPS:
   `{version, os, max_concurrency, agents, running, roots_count}` every 30 seconds (backing off up to 5 minutes on
   errors). `roots_count` is the number of root folders configured, always sent (0 when there are none), so collie can
   tell a machine with no roots from one whose roots hold no matching repo. A 401 means the machine was revoked or its
-  token is invalid.
-- `GET /machine/v1/codebases`, `PUT /machine/v1/inventory {repos: [{codebase_id, path}]}`, `GET /machine/v1/bindings`.
-- `wss://<server>/cable` (bearer token, `Origin: <server>`, `MachineChannel`), with `GET /machine/v1/dispatches?wait=25`
+  token is invalid. collie answers `{bindings_version, codebases_version}`.
+- `GET /machine/v1/codebases`,
+  `PUT /machine/v1/inventory {repos: [{codebase_id, path, source, remote, alternatives: [{path, source, remote}]}]}`
+  (`source` is `root`, `claude`, `codex` or `scan`; the keys after `path` are optional for collie),
+  `GET /machine/v1/bindings`.
+- `wss://<server>/cable` (bearer token, `Origin: <server>`, `MachineChannel`: `dispatch` and
+  `{type: "codebases_changed", codebases_version}` messages), with `GET /machine/v1/dispatches?wait=25`
   as the fallback, and `POST /machine/v1/dispatches/:id/ack {accepted, reason}`.
 - `POST /machine/v1/sessions/:id/token` (renew; 409 means the session is gone) and
   `POST /machine/v1/sessions/:id/events` (`started` with the session URL, `finished` with the exit code).

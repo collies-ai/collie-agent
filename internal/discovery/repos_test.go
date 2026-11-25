@@ -178,9 +178,10 @@ func TestScanAndMatchReportsOnlyMatchingRepos(t *testing.T) {
 	}
 	got := Inventory(Match(repos, codebases))
 	want := []machine.InventoryRepo{
-		{CodebaseID: 1, Path: filepath.Join(root, "collie")},
-		{CodebaseID: 1, Path: filepath.Join(root, "fork")}, // matched by its upstream remote, ranked after origin
-		{CodebaseID: 10, Path: filepath.Join(root, "work", "agent")},
+		{CodebaseID: 1, Path: filepath.Join(root, "collie"), Remote: "origin", Alternatives: []machine.InventoryClone{
+			{Path: filepath.Join(root, "fork"), Remote: "upstream"}, // matched by its upstream remote, ranked after origin
+		}},
+		{CodebaseID: 10, Path: filepath.Join(root, "work", "agent"), Remote: "origin"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("inventory = %+v\nwant %+v", got, want)
@@ -237,7 +238,7 @@ func TestMatchThroughSSHAlias(t *testing.T) {
 	setSSHConfig(t, cfg)
 	repos := []Repo{{Path: "/w/collie", Remotes: []Remote{{"origin", "git@github-work:jfromaniello/collie.git"}}}}
 	got := Inventory(Match(repos, []machine.Codebase{{CodebaseID: 1, RepoFullName: "jfromaniello/collie"}}))
-	if want := []machine.InventoryRepo{{CodebaseID: 1, Path: "/w/collie"}}; !reflect.DeepEqual(got, want) {
+	if want := []machine.InventoryRepo{{CodebaseID: 1, Path: "/w/collie", Remote: "origin"}}; !reflect.DeepEqual(got, want) {
 		t.Errorf("inventory = %+v", got)
 	}
 	setSSHConfig(t, filepath.Join(t.TempDir(), "missing"))

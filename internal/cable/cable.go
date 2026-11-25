@@ -72,8 +72,10 @@ type frame struct {
 
 // Run connects, subscribes and calls onDispatch for every dispatch until ctx is done (nil), the connection fails
 // (an error), or collie refuses the token (ErrUnauthorized). onSubscribed is called once the subscription is
-// confirmed. Run does not reconnect: the caller does, with backoff, and long-polls meanwhile.
-func (c *Client) Run(ctx context.Context, onSubscribed func(), onDispatch func(machine.Dispatch)) error {
+// confirmed. onCodebasesChanged (optional) is called with collie's codebases_version ("" when it sent none) when the
+// codebases this machine may serve changed. Run does not reconnect: the caller does, with backoff, and long-polls
+// meanwhile.
+func (c *Client) Run(ctx context.Context, onSubscribed func(), onDispatch func(machine.Dispatch), onCodebasesChanged func(version string)) error {
 	wsURL, err := c.URL()
 	if err != nil {
 		return err
@@ -144,11 +146,25 @@ func (c *Client) Run(ctx context.Context, onSubscribed func(), onDispatch func(m
 			if f.Identifier != string(identifier) || len(f.Message) == 0 {
 				continue
 			}
-			var d machine.Dispatch
-			if err := json.Unmarshal(f.Message, &d); err != nil || d.Type != "dispatch" || d.DispatchID == 0 {
+			var head struct {
+				Type             string          `json:"type"`
+				CodebasesVersion json.RawMessage `json:"codebases_version"`
+			}
+			if err := json.Unmarshal(f.Message, &head); err != nil {
 				continue
 			}
-			onDispatch(d)
+			switch head.Type {
+			case "codebases_changed":
+				if onCodebasesChanged != nil {
+					onCodebasesChanged(machine.VersionString(head.CodebasesVersion))
+				}
+			case "dispatch":
+				var d machine.Dispatch
+				if err := json.Unmarshal(f.Message, &d); err != nil || d.DispatchID == 0 {
+					continue
+				}
+				onDispatch(d)
+			}
 		}
 	}
 }

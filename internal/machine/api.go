@@ -19,10 +19,23 @@ type Codebase struct {
 	RepoFullName string `json:"repo_full_name"`
 }
 
-// InventoryRepo is a repo found on this machine whose remote matches a codebase.
+// InventoryRepo is a codebase found on this machine: the clone collie-agent chose for it and the other clones
+// (Alternatives, best first). Source is where the clone was found (root, claude, codex or scan) and Remote the name of
+// the remote that matched (origin, or e.g. upstream for a fork). A collie that does not know the newer keys reads only
+// codebase_id and path.
 type InventoryRepo struct {
-	CodebaseID int64  `json:"codebase_id"`
-	Path       string `json:"path"`
+	CodebaseID   int64            `json:"codebase_id"`
+	Path         string           `json:"path"`
+	Source       string           `json:"source,omitempty"`
+	Remote       string           `json:"remote,omitempty"`
+	Alternatives []InventoryClone `json:"alternatives,omitempty"`
+}
+
+// InventoryClone is another clone of an InventoryRepo's codebase.
+type InventoryClone struct {
+	Path   string `json:"path"`
+	Source string `json:"source,omitempty"`
+	Remote string `json:"remote,omitempty"`
 }
 
 // Binding is a machine runner: a folder of this machine bound to a project's codebase (GET /machine/v1/bindings).
