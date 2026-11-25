@@ -14,8 +14,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS runs the launchd tests against plutil, Linux the systemd ones against systemd-analyze.
-        os: [ubuntu-latest, macos-latest]
+        # Linux runs the systemd tests against systemd-analyze and checks the launchd plist in Go. macOS (slow to get
+        # a runner) only runs on pushes to main, where it also lints the plist with plutil; PRs do not wait for it.
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
