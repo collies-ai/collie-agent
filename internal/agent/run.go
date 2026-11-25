@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -96,6 +97,8 @@ type Runner struct {
 	// folders (exactly, never their children) only while config.json has discover.
 	exactMu sync.Mutex
 	exact   []string
+	// resync says the last bindings sync failed after the exact folders changed: the next heartbeat or scan retries it.
+	resync atomic.Bool
 }
 
 func (r *Runner) sleep(ctx context.Context, d time.Duration) error {
@@ -295,7 +298,7 @@ func (r *Runner) heartbeatLoop(ctx context.Context, bound chan struct{}) error {
 			})
 			if r.Remote == nil {
 				markBound()
-			} else if resp.BindingsVersion != synced || synced == "" {
+			} else if resp.BindingsVersion != synced || synced == "" || r.resync.Load() {
 				if err := r.syncBindings(ctx); err != nil {
 					if errors.Is(err, machine.ErrRevoked) || ctx.Err() != nil {
 						return ignoreCanceled(ctx, err)
@@ -363,6 +366,14 @@ func (r *Runner) setExact(repos []discovery.Repo) bool {
 	return true
 }
 
+// applyAllowed gives the dispatcher the current allowed folders, keeping its bindings. It holds syncMu so a sync in
+// flight cannot put back the folders it read before.
+func (r *Runner) applyAllowed() {
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+	r.dispatcher.SetAllowed(r.allowed())
+}
+
 // syncBindings fetches collie's bindings, applies the local config and hands them to the dispatcher.
 func (r *Runner) syncBindings(ctx context.Context) error {
 	r.syncMu.Lock()
@@ -374,6 +385,7 @@ func (r *Runner) syncBindings(ctx context.Context) error {
 	allowed := r.allowed() // read under syncMu: a discovery that changes it after this point syncs again
 	resolved := bindings.Resolve(server, r.settings(), allowed)
 	r.dispatcher.SetBindings(resolved, allowed)
+	r.resync.Store(false)
 	states := make([]config.BindingState, 0, len(resolved))
 	for _, b := range resolved {
 		if !b.Usable() {
@@ -415,9 +427,16 @@ func (r *Runner) reportInventory(ctx context.Context) error {
 		}
 	}
 	repos := discover(r.settings().RootFolders, r.settings().DiscoverFrom())
-	// Discovered folders become allowed binding folders: bindings refused for lack of them are checked again.
-	if r.setExact(repos) && len(r.settings().DiscoverFrom()) > 0 && r.dispatcher != nil {
+	// Discovered folders are allowed binding folders. When they change, the dispatcher's boundary changes right away
+	// (a repo no longer trusted is refused from the next offer, whatever collie answers), and the bindings are synced
+	// again so the ones refused for lack of a folder are checked again. A failed sync is retried by the next heartbeat
+	// or scan.
+	if changed := r.setExact(repos); len(r.settings().DiscoverFrom()) > 0 && r.dispatcher != nil && (changed || r.resync.Load()) {
+		if changed {
+			r.applyAllowed()
+		}
 		if err := r.syncBindings(ctx); err != nil {
+			r.resync.Store(true)
 			if errors.Is(err, machine.ErrRevoked) {
 				return err
 			}

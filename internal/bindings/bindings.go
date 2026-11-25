@@ -31,7 +31,8 @@ type Binding struct {
 func (b Binding) Usable() bool { return b.Refused == "" }
 
 // Allowed is where a binding's folder may be: inside one of the Roots (the root folders), or exactly one of the Exact
-// folders (repos discovered from Claude Code or Codex, never their children).
+// folders (repos discovered from Claude Code or Codex, never their children). Exact folders are the symlink-free paths
+// discovery found: one that resolves anywhere else is ignored.
 type Allowed struct {
 	Roots []string
 	Exact []string
@@ -134,10 +135,23 @@ func Within(folder string, allowed Allowed) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !inside(real, resolveAll(allowed.Roots)) && !slices.Contains(resolveAll(allowed.Exact), real) {
+	if !inside(real, resolveAll(allowed.Roots)) && !slices.Contains(canonical(allowed.Exact), real) {
 		return "", outside(folder, len(allowed.Exact) > 0)
 	}
 	return real, nil
+}
+
+// canonical keeps the exact folders that still resolve to themselves. Discovery hands over symlink-free paths, so one
+// that now resolves elsewhere (replaced by a symlink) was never authorized where it points and does not count.
+func canonical(paths []string) []string {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = filepath.Clean(p)
+		if r, err := evalSymlinks(p); err == nil && r == p {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // outside is the refusal of a folder that is not allowed.
@@ -215,9 +229,14 @@ type Pinned struct {
 	Exact []Root
 }
 
-// PinRoots resolves the allowed folders now. Folders that do not resolve are left out.
+// PinRoots resolves the allowed folders now. Roots that do not resolve are left out, and so are exact folders that no
+// longer resolve to themselves.
 func PinRoots(allowed Allowed) Pinned {
-	return Pinned{Roots: pin(allowed.Roots), Exact: pin(allowed.Exact)}
+	exact := make([]Root, 0, len(allowed.Exact))
+	for _, p := range canonical(allowed.Exact) {
+		exact = append(exact, Root{Path: p, Resolved: p})
+	}
+	return Pinned{Roots: pin(allowed.Roots), Exact: exact}
 }
 
 func pin(paths []string) []Root {

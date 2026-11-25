@@ -80,6 +80,15 @@ func (d *Dispatcher) SetBindings(bs []bindings.Binding, allowed bindings.Allowed
 	d.mu.Unlock()
 }
 
+// SetAllowed replaces only the allowed folders, keeping the bindings: a narrower boundary applies to the next offer
+// even before collie's bindings can be fetched again.
+func (d *Dispatcher) SetAllowed(allowed bindings.Allowed) {
+	pinned := bindings.PinRoots(allowed)
+	d.mu.Lock()
+	d.allowed = pinned
+	d.mu.Unlock()
+}
+
 // Running returns the ids of the sessions running now, for the heartbeat.
 func (d *Dispatcher) Running() []string {
 	d.mu.Lock()

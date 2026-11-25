@@ -233,24 +233,34 @@ func TestWithoutExactFoldersOnlyRootsAreAllowed(t *testing.T) {
 
 func TestASwappedExactFolderIsRefused(t *testing.T) {
 	parent := realDir(t)
-	real1 := filepath.Join(parent, "real1")
+	repo := filepath.Join(parent, "repo") // canonical, as discovery hands it over
 	evil := filepath.Join(parent, "evil")
-	_ = os.MkdirAll(real1, 0o755)
+	_ = os.MkdirAll(repo, 0o755)
 	_ = os.MkdirAll(evil, 0o755)
-	repo := filepath.Join(parent, "repo")
-	if err := os.Symlink(real1, repo); err != nil {
-		t.Fatal(err)
+	swap := func() {
+		t.Helper()
+		_ = os.RemoveAll(repo)
+		if err := os.Symlink(evil, repo); err != nil {
+			t.Fatal(err)
+		}
 	}
-	pinned := PinRoots(Allowed{Exact: []string{repo}})
-	// The discovered folder is swapped for a link to somewhere else after the sync.
-	_ = os.Remove(repo)
-	if err := os.Symlink(evil, repo); err != nil {
-		t.Fatal(err)
+	allowed := Allowed{Exact: []string{repo}}
+
+	// Swapped after the sync: the pinned folder no longer resolves where it did.
+	pinned := PinRoots(allowed)
+	swap()
+	for _, f := range []string{repo, evil} {
+		if got, err := WithinPinned(f, pinned); err == nil {
+			t.Errorf("WithinPinned accepted %s after the swap: %s", f, got)
+		}
 	}
-	if got, err := WithinPinned(repo, pinned); err == nil {
-		t.Fatalf("WithinPinned accepted the swapped folder: %s", got)
+	// Swapped before a later sync: the exact folder is not followed to its new target.
+	for _, f := range []string{repo, evil} {
+		if got, err := Within(f, allowed); err == nil {
+			t.Errorf("Within accepted %s: %s", f, got)
+		}
 	}
-	if got, err := WithinPinned(evil, pinned); err == nil {
-		t.Fatalf("WithinPinned accepted the swap target: %s", got)
+	if p := PinRoots(allowed); len(p.Exact) != 0 {
+		t.Errorf("a swapped exact folder was pinned: %+v", p.Exact)
 	}
 }

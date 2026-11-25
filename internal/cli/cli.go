@@ -297,7 +297,12 @@ func (a *App) askDiscover(p config.Profile, flag []string) error {
 			return nil
 		}
 		fmt.Fprint(a.Stdout, "Use the repos you already opened with Claude Code or Codex? [Y/n] ")
-		line, _ := bufio.NewReader(a.Stdin).ReadString('\n')
+		line, err := bufio.NewReader(a.Stdin).ReadString('\n')
+		if err != nil && (err != io.EOF || strings.TrimSpace(line) == "") {
+			// No answer (end of input or a read error) is not consent: leave it unset.
+			fmt.Fprintln(a.Stdout, "\nNo answer: only repos under root folders will be found (pair --force --discover claude,codex turns discovery on).")
+			return nil
+		}
 		switch strings.ToLower(strings.TrimSpace(line)) {
 		case "", "y", "yes":
 			answer = slices.Clone(config.DiscoverSources)
@@ -315,12 +320,6 @@ func (a *App) askDiscover(p config.Profile, flag []string) error {
 		fmt.Fprintf(a.Stdout, "Only repos under root folders will be found (collie-agent roots add <folder>).\n")
 	}
 	return nil
-}
-
-// stdinIsTerminal reports whether the process's stdin is a terminal (a character device).
-func stdinIsTerminal() bool {
-	info, err := os.Stdin.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
 func (a *App) unpair(p config.Profile, args []string) int {

@@ -38,8 +38,9 @@ collie-agent status             # pairing, connection, roots, bindings and servi
 Once paired, `pair` asks **"Use the repos you already opened with Claude Code or Codex? [Y/n]"** (Enter means yes).
 The answer goes to `config.json` as `"discover": ["claude", "codex"]` (or `[]` for no) and can be edited there later.
 With it, collie-agent finds the repos you already trust in Claude Code or Codex without any root folder, and those
-exact repo folders may be bound (see Discovery below). It asks only on a terminal, and only when `config.json` has no
-answer yet, so `pair --force` keeps an earlier one. `--discover claude,codex` (or `claude`, `codex`, `none`) answers
+exact repo folders may be bound (see Discovery below). It asks only on a terminal (stdin redirected from a file or
+`/dev/null` is not one), and only when `config.json` has no answer yet, so `pair --force` keeps an earlier one. No
+answer (end of input) leaves it unset. `--discover claude,codex` (or `claude`, `codex`, `none`) answers
 it from a script.
 
 The machine id and token are stored in `~/.config/collie-agent/credentials.json` (or under `$XDG_CONFIG_HOME`)
@@ -94,7 +95,8 @@ instead.
     is not a documented interface, so when it is missing or unreadable collie-agent scans `~/Projects`, `~/code`,
     `~/src`, `~/dev` and `~/work` instead, up to 4 levels (source `scan`);
   - with `"discover"` including `codex`: the `[projects."<path>"]` of `~/.codex/config.toml` with
-    `trust_level = "trusted"` (source `codex`).
+    `trust_level = "trusted"` (source `codex`). Text inside strings and arrays is never read as config, and a file that
+    cannot be read unambiguously trusts nothing.
 
   Missing folders, temp dirs (`/tmp`, `/var/folders`) and worktrees (`*/.claude/worktrees/*`) are skipped, and repos
   without a remote are ignored. It then asks collie for the codebases of the projects granted to this machine, and
@@ -110,8 +112,9 @@ instead.
 - **Bindings.** In collie you bind a codebase found on this machine to an agent. collie-agent fetches the bindings
   whenever collie's `bindings_version` changes. **The machine has the last word**: a binding whose folder is outside
   the root folders (after resolving symlinks) is refused whatever collie says, unless discovery is on and the folder is
-  exactly one of the repos discovery found (never a folder inside it; it is checked against where it resolved when the
-  bindings were synced, so a swapped symlink is refused), and the local config can pin or
+  exactly one of the repos discovery found (never a folder inside it, and only while that symlink-free path still
+  resolves to itself: a discovered folder later replaced by a symlink is refused). A repo discovery no longer finds is
+  refused from the next offer, even before collie's bindings can be fetched again, and the local config can pin or
   override any binding.
 - **Dispatches.** It holds a cable connection to collie (`wss://<server>/cable`, `MachineChannel`) and reconnects
   with backoff; while the cable is down it long-polls `GET /machine/v1/dispatches`. Each offer is only a job

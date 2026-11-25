@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -425,7 +426,6 @@ func TestPairAsksAboutDiscovery(t *testing.T) {
 		{"\n", []string{"claude", "codex"}},
 		{"y\n", []string{"claude", "codex"}},
 		{"Yes\n", []string{"claude", "codex"}},
-		{"", []string{"claude", "codex"}}, // EOF counts as Enter
 		{"n\n", []string{}},
 		{"no\n", []string{}},
 	}
@@ -444,6 +444,50 @@ func TestPairAsksAboutDiscovery(t *testing.T) {
 		if !ok || !reflect.DeepEqual(got, c.want) {
 			t.Errorf("%q: discover = %v (set %v), want %v", c.input, got, ok, c.want)
 		}
+	}
+}
+
+func TestPairWithNoAnswerLeavesDiscoveryUnset(t *testing.T) {
+	for _, in := range []io.Reader{strings.NewReader(""), strings.NewReader("   "), errReader{}} {
+		h := newHarness(t, "linux")
+		srv := collieServer(t, nil)
+		h.app.Stdin = in
+		h.app.IsTerminal = func() bool { return true }
+		if code := h.run("pair", "--server", srv.URL); code != 0 {
+			t.Fatalf("pair = %d: %s", code, h.err)
+		}
+		if got, ok := discoverIn(t, h); ok {
+			t.Errorf("%T: discover written without an answer: %v", in, got)
+		}
+	}
+	// "y" right before the end of input (no newline) is still an answer.
+	h := newHarness(t, "linux")
+	srv := collieServer(t, nil)
+	h.app.Stdin = strings.NewReader("y")
+	h.app.IsTerminal = func() bool { return true }
+	if code := h.run("pair", "--server", srv.URL); code != 0 {
+		t.Fatalf("pair = %d: %s", code, h.err)
+	}
+	if got, _ := discoverIn(t, h); !reflect.DeepEqual(got, []string{"claude", "codex"}) {
+		t.Errorf("discover = %v", got)
+	}
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("input/output error") }
+
+func TestDevNullIsNotATerminal(t *testing.T) {
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	old := os.Stdin
+	os.Stdin = f
+	defer func() { os.Stdin = old }()
+	if stdinIsTerminal() {
+		t.Error("/dev/null counted as a terminal")
 	}
 }
 

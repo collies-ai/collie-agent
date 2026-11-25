@@ -1,7 +1,6 @@
 package discovery
 
 import (
-	"bufio"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -166,37 +165,137 @@ func claudeProjectDir(path string) string {
 	return string(b)
 }
 
-// codexFolders reads ~/.codex/config.toml: the [projects."<path>"] tables whose trust_level is "trusted". It is a
-// small line parser for that shape only, not a TOML parser.
+// codexFolders reads ~/.codex/config.toml: the [projects."<path>"] tables whose trust_level is "trusted". It is not
+// a full TOML parser, but it tracks where a statement can start (outside strings, multiline strings and arrays), so
+// text inside a value is never read as a table or a key. When the file cannot be read unambiguously it trusts nothing.
 func codexFolders(home string) []Folder {
-	f, err := os.Open(filepath.Join(home, ".codex", "config.toml"))
+	b, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
 	var out []Folder
-	current := ""
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if strings.HasPrefix(line, "[") {
-			current = codexProjectHeader(line)
+	var sc tomlScanner
+	current := "" // the project path of the table being read
+	for _, raw := range strings.Split(string(b), "\n") {
+		line := strings.TrimSuffix(raw, "\r")
+		if !sc.atStatement() {
+			if !sc.scan(line) {
+				return nil
+			}
 			continue
 		}
-		if current == "" {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "" || strings.HasPrefix(trimmed, "#"):
+			continue
+		case strings.HasPrefix(trimmed, "["):
+			current = codexProjectHeader(trimmed)
+			if !sc.scan(line) || !sc.atStatement() {
+				return nil // a header never spans lines
+			}
 			continue
 		}
-		key, value, found := strings.Cut(line, "=")
-		if !found || strings.TrimSpace(key) != "trust_level" {
-			continue
+		key, value, found := strings.Cut(trimmed, "=")
+		if !found {
+			return nil
 		}
-		if v, ok := tomlString(strings.TrimSpace(value)); ok && v == "trusted" && usable(current) {
-			out = append(out, Folder{Path: filepath.Clean(current), Source: SourceCodex})
-			current = "" // one entry per table
+		if current != "" && strings.TrimSpace(key) == "trust_level" {
+			if v, ok := tomlString(strings.TrimSpace(value)); ok && v == "trusted" && usable(current) {
+				out = append(out, Folder{Path: filepath.Clean(current), Source: SourceCodex})
+				current = "" // one entry per table
+			}
+		}
+		if !sc.scan(line) {
+			return nil
 		}
 	}
+	if !sc.atStatement() {
+		return nil // a string or an array left open at the end of the file
+	}
 	return out
+}
+
+// tomlScanner follows TOML values across lines: whether the next line is inside a multiline string or an array, or
+// starts a new statement.
+type tomlScanner struct {
+	multiline string // the open multiline string's delimiter (""" or '''), or ""
+	depth     int    // open [ of arrays (or a header) not closed yet
+}
+
+func (t *tomlScanner) atStatement() bool { return t.multiline == "" && t.depth == 0 }
+
+// scan reads one line, updating the state. It returns false on what it cannot read: a one-line string left open or a
+// ] without its [.
+func (t *tomlScanner) scan(line string) bool {
+	for i := 0; i < len(line); {
+		if t.multiline != "" {
+			end := closingDelimiter(line[i:], t.multiline)
+			if end < 0 {
+				return true // the string goes on in the next line
+			}
+			i += end + len(t.multiline)
+			t.multiline = ""
+			continue
+		}
+		switch c := line[i]; {
+		case c == '#':
+			return true
+		case strings.HasPrefix(line[i:], `"""`), strings.HasPrefix(line[i:], "'''"):
+			t.multiline = line[i : i+3]
+			i += 3
+		case c == '"' || c == '\'':
+			end := closingQuote(line[i+1:], c)
+			if end < 0 {
+				return false
+			}
+			i += end + 2
+		case c == '[':
+			t.depth++
+			i++
+		case c == ']':
+			t.depth--
+			if t.depth < 0 {
+				return false
+			}
+			i++
+		default:
+			i++
+		}
+	}
+	return true
+}
+
+// closingDelimiter finds the end of a multiline string in s: the index of the closing delimiter (an unescaped """ for
+// basic strings), or -1.
+func closingDelimiter(s, delim string) int {
+	for i := 0; i+len(delim) <= len(s); i++ {
+		if delim == `"""` && s[i] == '\\' {
+			i++
+			continue
+		}
+		if strings.HasPrefix(s[i:], delim) {
+			// A run of more quotes ends with the delimiter: """"" closes with the last three.
+			for i+len(delim) < len(s) && s[i+len(delim)] == delim[0] {
+				i++
+			}
+			return i
+		}
+	}
+	return -1
+}
+
+// closingQuote finds the closing quote of a one-line string in s (escapes count in basic strings), or -1.
+func closingQuote(s string, quote byte) int {
+	for i := 0; i < len(s); i++ {
+		if quote == '"' && s[i] == '\\' {
+			i++
+			continue
+		}
+		if s[i] == quote {
+			return i
+		}
+	}
+	return -1
 }
 
 // codexProjectHeader returns the path of a [projects."<path>"] (or [projects.'<path>']) table header, or "".

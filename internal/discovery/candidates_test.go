@@ -227,3 +227,59 @@ func TestCodexProjectHeader(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexTrustInsideStringsIsNotConfig(t *testing.T) {
+	setTempDirs(t)
+	home := realDir(t, t.TempDir())
+	good, evil1, evil2, evil3 := filepath.Join(home, "good"), filepath.Join(home, "evil1"), filepath.Join(home, "evil2"), filepath.Join(home, "evil3")
+	for _, d := range []string{good, evil1, evil2, evil3} {
+		_ = os.MkdirAll(d, 0o755)
+	}
+	write := func(content string) {
+		writeFile(t, filepath.Join(home, ".codex", "config.toml"), content)
+	}
+	paths := func() []string {
+		var out []string
+		for _, f := range codexFolders(home) {
+			out = append(out, f.Path)
+		}
+		return out
+	}
+
+	write(`instructions = """
+[projects."` + evil1 + `"]
+trust_level = "trusted"
+"""
+notes = '''
+[projects."` + evil2 + `"]
+trust_level = "trusted" '''
+list = [
+  "a",
+  '[projects."` + evil3 + `"]',
+  [ "nested", "]" ],
+]
+[projects."` + good + `"]
+trust_level = "trusted"
+`)
+	if got := paths(); !reflect.DeepEqual(got, []string{good}) {
+		t.Errorf("trusted = %v, want only %s", got, good)
+	}
+
+	// A file that cannot be read unambiguously trusts nothing.
+	for _, broken := range []string{
+		`x = """` + "\n" + `[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n",
+		`x = [` + "\n" + `[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n",
+		`x = "open` + "\n" + `[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n",
+		`[projects."` + good + `"]` + "\n" + `trust_level = "trusted"` + "\n" + "garbage line\n",
+	} {
+		write(broken)
+		if got := paths(); len(got) != 0 {
+			t.Errorf("broken config %q trusted %v", broken, got)
+		}
+	}
+	// A trust value that is not a plain one-line string is not trusted.
+	write(`[projects."` + good + `"]` + "\n" + `trust_level = """trusted"""` + "\n")
+	if got := paths(); len(got) != 0 {
+		t.Errorf("multiline trust value counted: %v", got)
+	}
+}

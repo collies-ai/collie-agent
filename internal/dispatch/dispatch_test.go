@@ -456,17 +456,13 @@ func TestASwappedExactFolderIsDeclined(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	real1, evil := filepath.Join(base, "real"), filepath.Join(base, "evil")
-	_ = os.MkdirAll(real1, 0o755)
+	repo, evil := filepath.Join(base, "collie"), filepath.Join(base, "evil")
+	_ = os.MkdirAll(repo, 0o755)
 	_ = os.MkdirAll(evil, 0o755)
-	link := filepath.Join(base, "collie")
-	if err := os.Symlink(real1, link); err != nil {
-		t.Fatal(err)
-	}
-	d.SetBindings([]bindings.Binding{binding(1, link, 1)}, bindings.Allowed{Exact: []string{link}})
-	// After the sync, the discovered folder is pointed somewhere else.
-	_ = os.Remove(link)
-	if err := os.Symlink(evil, link); err != nil {
+	d.SetBindings([]bindings.Binding{binding(1, repo, 1)}, bindings.Allowed{Exact: []string{repo}})
+	// After the sync, the discovered folder is replaced by a link to somewhere else.
+	_ = os.RemoveAll(repo)
+	if err := os.Symlink(evil, repo); err != nil {
 		t.Fatal(err)
 	}
 	_ = d.Handle(context.Background(), offer(1, 1))
