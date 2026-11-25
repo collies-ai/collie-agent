@@ -484,3 +484,55 @@ func TestALateRevokedAckStopsTheRunnerAfterAReconnect(t *testing.T) {
 		t.Fatal("a 401 from an ack that finished after the cable reconnected did not stop the runner")
 	}
 }
+
+func TestACable401StopsTheRunnerWithoutPolling(t *testing.T) {
+	for _, mode := range []string{"refused at the upgrade", "disconnect unauthorized"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newFakeCollie(t)
+			r, _, _ := setup(t, f)
+			// Only the cable rejects the token; the HTTP API still accepts it, so a fallback would keep polling.
+			r.Cable = cableRejecting{mode: mode}
+			done := make(chan error, 1)
+			go func() { done <- r.Loop(context.Background()) }()
+			select {
+			case err := <-done:
+				if !errors.Is(err, machine.ErrRevoked) {
+					t.Fatalf("Loop = %v, want ErrRevoked", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("a 401 on the cable did not stop the runner")
+			}
+			f.mu.Lock()
+			polls := f.polls
+			f.mu.Unlock()
+			if polls != 0 {
+				t.Errorf("long-polled %d times after the cable refused the token", polls)
+			}
+			st, _ := r.Profile.LoadState()
+			if !st.Revoked {
+				t.Errorf("state = %+v", st)
+			}
+		})
+	}
+}
+
+// cableRejecting runs the real cable client against a server that refuses the token on the cable only.
+type cableRejecting struct{ mode string }
+
+func (c cableRejecting) Run(ctx context.Context, onSubscribed func(), onDispatch func(machine.Dispatch)) error {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if c.mode == "refused at the upgrade" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{"actioncable-v1-json"}, InsecureSkipVerify: true})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		_ = conn.Write(r.Context(), websocket.MessageText, []byte(`{"type":"disconnect","reason":"unauthorized","reconnect":false}`))
+		_, _, _ = conn.Read(r.Context())
+	}))
+	defer srv.Close()
+	return (&cable.Client{Server: srv.URL, Token: "tok"}).Run(ctx, onSubscribed, onDispatch)
+}

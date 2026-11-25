@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/collies-ai/collie-agent/internal/bindings"
+	"github.com/collies-ai/collie-agent/internal/cable"
 	"github.com/collies-ai/collie-agent/internal/config"
 	"github.com/collies-ai/collie-agent/internal/discovery"
 	"github.com/collies-ai/collie-agent/internal/dispatch"
@@ -390,6 +391,11 @@ func (r *Runner) connectionLoop(ctx context.Context) error {
 			stopCable()
 			if ctx.Err() != nil {
 				return nil
+			}
+			// collie refused the machine token on the cable (a 401 on the upgrade, or disconnect: unauthorized): the
+			// machine was revoked, like any other 401. Stop instead of falling back to the long-poll.
+			if errors.Is(err, cable.ErrUnauthorized) {
+				return fmt.Errorf("%w (%v)", machine.ErrRevoked, err)
 			}
 			if !subscribedAt.IsZero() && r.now().Sub(subscribedAt) > time.Minute {
 				backoff = time.Second // it was healthy for a while: reconnect quickly
