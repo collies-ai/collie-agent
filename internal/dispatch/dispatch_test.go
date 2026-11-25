@@ -347,3 +347,29 @@ func TestARedirectedRootNoLongerCounts(t *testing.T) {
 		})
 	}
 }
+
+// collie offers research to a codebase's code bindings when it has no research binding: the code agent takes it.
+func TestResearchRunsOnTheCodeAgentWithoutAResearchAgent(t *testing.T) {
+	api := &fakeAPI{}
+	sess := &fakeSessions{}
+	d := &Dispatcher{API: api, Sessions: sess, MaxConcurrency: 4}
+	own := binding(2, "/code/other", 1)
+	own.Agents["research"] = "codex"
+	setBindings(t, d, []bindings.Binding{binding(1, "/code/collie", 1), own})
+
+	research := offer(1, 1)
+	research.Purpose = "research"
+	_ = d.Handle(context.Background(), research)
+	theirs := offer(2, 2)
+	theirs.Purpose = "research"
+	_ = d.Handle(context.Background(), theirs)
+
+	if len(api.acks) != 2 || !api.acks[0].Accept || !api.acks[1].Accept {
+		t.Fatalf("acks = %+v", api.acks)
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if len(sess.started) != 2 || sess.started[0].Agent != "claude" || sess.started[1].Agent != "codex" {
+		t.Errorf("research ran on %+v, want the code agent, then the binding's own research agent", sess.started)
+	}
+}
