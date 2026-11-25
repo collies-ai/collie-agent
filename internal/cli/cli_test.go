@@ -275,15 +275,16 @@ func TestRunHeartbeatsUntilStopped(t *testing.T) {
 	srv := collieServer(t, &status)
 	h.run("pair", "--server", srv.URL)
 	ctx, cancel := context.WithCancel(context.Background())
-	n := 0
+	var n atomic.Int32
 	h.app.Context = ctx
-	h.app.RunSleep = func(context.Context, time.Duration) error {
-		n++
-		if n == 3 {
+	h.app.RunSleep = func(sctx context.Context, d time.Duration) error {
+		// Several loops sleep concurrently (heartbeat, inventory, connection): stop after a few heartbeats' worth.
+		if n.Add(1) >= 3 {
 			cancel()
 			return context.Canceled
 		}
-		return nil
+		time.Sleep(5 * time.Millisecond)
+		return sctx.Err()
 	}
 	if code := h.run("run"); code != 0 {
 		t.Fatalf("run = %d: %s", code, h.err)
@@ -342,5 +343,48 @@ func TestServiceGetsAnAbsoluteConfigDir(t *testing.T) {
 	}
 	if strings.Contains(got, "XDG_CONFIG_HOME") {
 		t.Errorf("unit passes a relative XDG_CONFIG_HOME:\n%s", got)
+	}
+}
+
+func TestRootsAddListRemove(t *testing.T) {
+	h := newHarness(t, "linux")
+	dir := t.TempDir()
+	if code := h.run("roots", "list"); code != 0 || !strings.Contains(h.out.String(), "No root folders") {
+		t.Errorf("empty list = %d %q", code, h.out)
+	}
+	if code := h.run("roots", "add", dir); code != 0 {
+		t.Fatalf("add = %d: %s", code, h.err)
+	}
+	if code := h.run("roots", "add", dir); code != 0 || !strings.Contains(h.out.String(), "already") {
+		t.Errorf("add twice = %d %q", code, h.out)
+	}
+	if code := h.run("roots", "add", filepath.Join(dir, "missing")); code == 0 {
+		t.Error("added a missing folder")
+	}
+	h.run("roots")
+	if strings.TrimSpace(h.out.String()) != dir {
+		t.Errorf("list = %q", h.out)
+	}
+	cfg, _ := os.ReadFile(filepath.Join(h.base, "collie-agent", "config.json"))
+	if !strings.Contains(string(cfg), dir) {
+		t.Errorf("config.json = %s", cfg)
+	}
+	// Profiles keep their own roots.
+	h.run("--profile", "work", "roots", "list")
+	if !strings.Contains(h.out.String(), "No root folders") {
+		t.Errorf("work profile roots = %q", h.out)
+	}
+	h.run("status")
+	if !strings.Contains(h.out.String(), "Roots:       "+dir) {
+		t.Errorf("status:\n%s", h.out)
+	}
+	if code := h.run("roots", "remove", dir); code != 0 {
+		t.Fatalf("remove = %d: %s", code, h.err)
+	}
+	if code := h.run("roots", "remove", dir); code == 0 {
+		t.Error("removed a folder that is not a root")
+	}
+	if code := h.run("roots", "bogus"); code != exitUsage {
+		t.Errorf("bogus = %d", code)
 	}
 }

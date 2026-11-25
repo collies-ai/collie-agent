@@ -194,6 +194,24 @@ type State struct {
 	Revoked bool `json:"revoked,omitempty"`
 	// MachineID is the machine the state is about, so a new pairing does not inherit an old "revoked".
 	MachineID string `json:"machine_id,omitempty"`
+	// Connection is how dispatches arrive now: "cable", "long-poll" or "" (not connected).
+	Connection string `json:"connection,omitempty"`
+	// Bindings are the bindings as this machine serves them, with why one is refused.
+	Bindings []BindingState `json:"bindings,omitempty"`
+	// Repos is how many repos matching a codebase the last inventory reported.
+	Repos int `json:"repos,omitempty"`
+	// Running are the sessions running now.
+	Running []string `json:"running,omitempty"`
+}
+
+// BindingState is one binding in the state file.
+type BindingState struct {
+	RunnerID int64  `json:"runner_id"`
+	Project  string `json:"project"`
+	Codebase string `json:"codebase"`
+	Folder   string `json:"folder"`
+	Pinned   bool   `json:"pinned,omitempty"`
+	Refused  string `json:"refused,omitempty"`
 }
 
 // LoadState reads the state; a missing file is an empty state.
