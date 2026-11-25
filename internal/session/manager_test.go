@@ -464,7 +464,7 @@ func TestStaleWorktreesAreCleanedAtStartup(t *testing.T) {
 	}
 	// And a directory with no metadata at all.
 	_ = os.MkdirAll(filepath.Join(m.Dir, "78"), 0o700)
-	if !strings.Contains(worktrees(t, repo), "77") {
+	if !strings.Contains(worktrees(t, repo), filepath.Join(stale, "worktree")) {
 		t.Fatal("setup: no worktree")
 	}
 	m.Sweep(context.Background())
@@ -474,7 +474,7 @@ func TestStaleWorktreesAreCleanedAtStartup(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(m.Dir, "78")); !os.IsNotExist(err) {
 		t.Error("the directory without metadata is still there")
 	}
-	if strings.Contains(worktrees(t, repo), "77") {
+	if strings.Contains(worktrees(t, repo), filepath.Join(stale, "worktree")) {
 		t.Errorf("worktree still registered:\n%s", worktrees(t, repo))
 	}
 	if out, _ := exec.Command("git", "-C", repo, "branch", "--list", "collie/session-77").Output(); len(strings.TrimSpace(string(out))) > 0 {
@@ -842,20 +842,28 @@ func TestABranchCreatedByAFailedWorktreeAddIsCleanedUp(t *testing.T) {
 	}
 }
 
-// R3-1: a branch someone else created between the check and the add is never claimed.
-func TestABranchCreatedByAnotherProcessIsNotClaimed(t *testing.T) {
-	_, _, repo, _ := env(t)
-	dir := filepath.Join(t.TempDir(), "wt")
-	gitRun(t, repo, "branch", "collie/session-91") // as if created right after the existence check
-	if ownsWorktree(repo, dir, "collie/session-91") {
-		t.Fatal("a branch with no worktree at the session's path is claimed")
+// R3-1/R4-1: the session owns a branch from the moment git created it for the session, and only then: when the
+// checkout fails after that, cleanup still deletes it, and the same session can run again.
+func TestABranchIsOwnedFromItsCreation(t *testing.T) {
+	m, _, repo, _ := env(t)
+	sessionDir := filepath.Join(m.Dir, "91")
+	wt := filepath.Join(sessionDir, "worktree")
+	// The checkout fails after the branch exists: the worktree path is taken by a file.
+	_ = os.MkdirAll(sessionDir, 0o700)
+	if err := os.WriteFile(wt, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	gitRun(t, repo, "worktree", "add", dir, "collie/session-91")
-	if !ownsWorktree(repo, dir, "collie/session-91") {
-		t.Error("the session's own worktree on its branch is not recognized")
+	if err := addWorktree(context.Background(), repo, wt, "collie/session-91"); err == nil {
+		t.Fatal("addWorktree succeeded on a taken path")
 	}
-	if ownsWorktree(repo, dir, "main") {
-		t.Error("a worktree on another branch is claimed")
+	if err := removeWorktree(context.Background(), sessionDir); err != nil {
+		t.Logf("removeWorktree: %v", err)
+	}
+	if b := gitRun(t, repo, "branch", "--list", "collie/session-91"); b != "" {
+		t.Errorf("the branch the session created is orphaned: %q", b)
+	}
+	if err := addWorktree(context.Background(), repo, wt, "collie/session-91"); err != nil {
+		t.Errorf("the same session cannot run again: %v", err)
 	}
 }
 

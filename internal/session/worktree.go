@@ -78,6 +78,10 @@ func remoteHead(out string) string {
 
 // addWorktree creates dir as a worktree of repo on a new branch from the default branch, and records it so a sweep
 // can remove it if collie-agent dies. A branch that already exists is an error, never reused or deleted.
+//
+// The branch is created on its own first (`git branch` refuses one that exists, atomically) and recorded as the
+// session's right away, so cleanup deletes it whatever happens to the checkout after: a stop, a failing hook. That
+// step runs on its own short context, so a stop cannot leave a branch created but not recorded.
 func addWorktree(ctx context.Context, repo, dir, branch string) error {
 	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return err
@@ -87,62 +91,31 @@ func addWorktree(ctx context.Context, repo, dir, branch string) error {
 		b, _ := json.Marshal(m)
 		return os.WriteFile(metaPath, b, 0o600)
 	}
-	// The repo first, so a sweep can prune a half-made worktree; the branch only once this session created it.
+	// The repo first, so a sweep can prune a half-made worktree.
 	if err := write(worktreeMeta{Repo: repo}); err != nil {
 		return err
-	}
-	if branchExists(ctx, repo, branch) {
-		return fmt.Errorf("branch %s already exists in %s: collie-agent does not reuse or delete it", branch, repo)
 	}
 	base, err := defaultBase(ctx, repo)
 	if err != nil {
 		return err
 	}
-	_, addErr := git(ctx, repo, "worktree", "add", "-b", branch, dir, base)
-	// git can fail after it created the branch and the worktree (a post-checkout hook that exits nonzero, or a stop
-	// while it ran). The session owns the branch only if git registered this worktree on it: a branch someone else
-	// created in the meantime is never claimed. The check runs even when ctx was cancelled, so a stop does not orphan
-	// the branch.
-	if addErr == nil || ownsWorktree(repo, dir, branch) {
-		if err := write(worktreeMeta{Repo: repo, Branch: branch}); err != nil && addErr == nil {
-			return err
-		}
-	}
-	return addErr
-}
-
-// ownsWorktree reports whether git has dir registered as a worktree of repo on branch.
-func ownsWorktree(repo, dir, branch string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	out, err := git(ctx, repo, "worktree", "list", "--porcelain")
+	bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	_, err = git(bctx, repo, "branch", "--no-track", branch, base)
+	cancel()
 	if err != nil {
-		return false
-	}
-	want := map[string]bool{dir: true}
-	if real, err := filepath.EvalSymlinks(dir); err == nil {
-		want[real] = true
-	}
-	for _, block := range strings.Split(out, "\n\n") {
-		var path, ref string
-		for _, line := range strings.Split(block, "\n") {
-			if v, ok := strings.CutPrefix(line, "worktree "); ok {
-				path = v
-			}
-			if v, ok := strings.CutPrefix(line, "branch "); ok {
-				ref = v
-			}
+		if strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("branch %s already exists in %s: collie-agent does not reuse or delete it", branch, repo)
 		}
-		if want[path] && ref == "refs/heads/"+branch {
-			return true
-		}
+		return err
 	}
-	return false
-}
-
-func branchExists(ctx context.Context, repo, branch string) bool {
-	_, err := git(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
-	return err == nil
+	if err := write(worktreeMeta{Repo: repo, Branch: branch}); err != nil {
+		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, _ = git(dctx, repo, "branch", "-D", branch)
+		cancel()
+		return err
+	}
+	_, err = git(ctx, repo, "worktree", "add", dir, branch)
+	return err
 }
 
 // removeWorktree removes the worktree and its local branch (whatever the agent pushed stays on the remote), and the
