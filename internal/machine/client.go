@@ -111,12 +111,13 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 		return err
 	}
 	defer resp.Body.Close()
+	// The status alone says the token was rejected: decide before reading a body that may never arrive.
+	if resp.StatusCode == http.StatusUnauthorized {
+		return ErrRevoked
+	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return err
-	}
-	if resp.StatusCode == http.StatusUnauthorized {
-		return ErrRevoked
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		snippet := strings.TrimSpace(string(b))

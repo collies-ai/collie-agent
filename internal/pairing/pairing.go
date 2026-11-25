@@ -24,6 +24,9 @@ const DeviceCodeGrant = "urn:ietf:params:oauth:grant-type:device_code"
 // slowDownStep is how much RFC 8628 §3.5 says to add to the interval on every slow_down.
 const slowDownStep = 5 * time.Second
 
+// maxInterval caps the backoff after timeouts and server errors.
+const maxInterval = 60 * time.Second
+
 // defaultInterval is used when the server does not send one (RFC 8628 §3.2).
 const defaultInterval = 5 * time.Second
 
@@ -132,6 +135,14 @@ func (c *Client) Authorize(ctx context.Context, m Machine) (*DeviceAuthorization
 	if da.DeviceCode == "" || da.UserCode == "" || da.VerificationURI == "" {
 		return nil, errors.New("unexpected answer from collie: missing device_code, user_code or verification_uri")
 	}
+	if err := ValidateVerificationURI(da.VerificationURI); err != nil {
+		return nil, err
+	}
+	if da.VerificationURIComplete != "" {
+		if err := ValidateVerificationURI(da.VerificationURIComplete); err != nil {
+			return nil, err
+		}
+	}
 	return &da, nil
 }
 
@@ -163,12 +174,15 @@ func (c *Client) Poll(ctx context.Context, da *DeviceAuthorization) (*Result, er
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			continue // a network blip: try again after the interval
+			// A timeout or a network error: RFC 8628 §3.5 says to poll less often before retrying.
+			interval = backOff(interval)
+			continue
 		}
 		if status == http.StatusOK {
 			return parseToken(body)
 		}
 		if status >= 500 {
+			interval = backOff(interval)
 			continue
 		}
 		oe := decodeError(body)
@@ -184,6 +198,36 @@ func (c *Client) Poll(ctx context.Context, da *DeviceAuthorization) (*Result, er
 			return nil, fmt.Errorf("pairing failed (HTTP %d): %w", status, oe)
 		}
 	}
+}
+
+// backOff doubles the interval after a failed request, up to maxInterval. It starts from the interval in force, so
+// earlier slow_down increases are kept.
+func backOff(d time.Duration) time.Duration {
+	d *= 2
+	if d > maxInterval {
+		return maxInterval
+	}
+	return d
+}
+
+// ValidateVerificationURI checks a URL collie sent for the person to open: an absolute https URL (http only on a
+// loopback host, for development), so a broken or hostile server cannot make the OS opener run a local file, an
+// option or a custom scheme.
+func ValidateVerificationURI(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() || u.Host == "" || u.User != nil {
+		return fmt.Errorf("collie sent an invalid verification URL %q", raw)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		switch u.Hostname() {
+		case "localhost", "127.0.0.1", "::1":
+			return nil
+		}
+	}
+	return fmt.Errorf("collie sent a verification URL that is not https: %q", raw)
 }
 
 func parseToken(body []byte) (*Result, error) {

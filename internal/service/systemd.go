@@ -92,13 +92,21 @@ func (d *Systemd) Install(s Spec) error {
 	return nil
 }
 
-// Uninstall stops and disables the unit, deletes it and reloads systemd.
+// Uninstall stops and disables the unit, deletes it and reloads systemd. With no unit file there is nothing of ours
+// to stop. If stopping fails the file is kept, so the CLI never says it removed a service that still runs.
 func (d *Systemd) Uninstall() error {
-	_, _ = d.Run("systemctl", "--user", "disable", "--now", d.Name())
+	if _, err := os.Stat(d.Path()); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if out, err := d.Run("systemctl", "--user", "disable", "--now", d.Name()); err != nil {
+		return fmt.Errorf("systemctl --user disable --now %s: %v: %s", d.Name(), err, out)
+	}
 	if err := os.Remove(d.Path()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	_, _ = d.Run("systemctl", "--user", "daemon-reload")
+	if out, err := d.Run("systemctl", "--user", "daemon-reload"); err != nil {
+		return fmt.Errorf("systemctl --user daemon-reload: %v: %s", err, out)
+	}
 	return nil
 }
 

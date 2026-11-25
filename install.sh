@@ -80,7 +80,9 @@ main() {
   fi
 
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT INT TERM
+  staged=""
+  trap 'rm -rf "$tmp"; [ -z "$staged" ] || rm -f "$staged"' EXIT
+  trap 'exit 1' INT TERM
 
   say "Downloading collie-agent ($VERSION, $os/$arch)..."
   download "$base/$archive" "$tmp/$archive"
@@ -93,10 +95,13 @@ main() {
 
   tar -xzf "$tmp/$archive" -C "$tmp" collie-agent || fail "could not extract $archive"
   mkdir -p "$dir" || fail "could not create $dir"
-  # Write next to the target and rename, so a running collie-agent is replaced atomically.
-  cp "$tmp/collie-agent" "$dir/.collie-agent.new" || fail "could not write to $dir"
-  chmod 0755 "$dir/.collie-agent.new"
-  mv -f "$dir/.collie-agent.new" "$dir/collie-agent"
+  # Stage in a new file of our own next to the target (mktemp creates it, so no other installer and no symlink can
+  # be there), and rename only once it is complete: a running collie-agent is replaced atomically.
+  staged="$(mktemp "$dir/.collie-agent.XXXXXX")" || fail "could not write to $dir"
+  cat "$tmp/collie-agent" >"$staged" || fail "could not write to $dir"
+  chmod 0755 "$staged" || fail "could not make $staged executable"
+  mv -f "$staged" "$dir/collie-agent" || fail "could not install $dir/collie-agent"
+  staged=""
 
   say "Installed $("$dir/collie-agent" version) to $dir/collie-agent"
   case ":${PATH}:" in

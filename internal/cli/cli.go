@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
@@ -377,7 +378,11 @@ func (a *App) service(p config.Profile, args []string) int {
 		if err != nil {
 			return a.fail(fmt.Errorf("cannot find the collie-agent binary: %w", err))
 		}
-		spec := service.Spec{Profile: p, Executable: exe, Env: envFrom(a.Getenv)}
+		env, err := envFrom(a.Getenv)
+		if err != nil {
+			return a.fail(err)
+		}
+		spec := service.Spec{Profile: p, Executable: exe, Env: env}
 		if err := m.Install(spec); err != nil {
 			return a.fail(err)
 		}
@@ -416,12 +421,23 @@ func (a *App) service(p config.Profile, args []string) int {
 	}
 }
 
-func envFrom(getenv func(string) string) map[string]string {
+// envFrom is the environment the service gets: the installing shell's PATH, so it finds the same agent CLIs, and the
+// config base as an absolute path, since launchd and systemd do not start it in this working directory.
+func envFrom(getenv func(string) string) (map[string]string, error) {
 	env := map[string]string{}
-	for _, k := range []string{"PATH", "COLLIE_AGENT_CONFIG_DIR", "XDG_CONFIG_HOME"} {
-		if v := getenv(k); v != "" {
-			env[k] = v
-		}
+	if v := getenv("PATH"); v != "" {
+		env["PATH"] = v
 	}
-	return env
+	if v := getenv("COLLIE_AGENT_CONFIG_DIR"); v != "" {
+		abs, err := filepath.Abs(v)
+		if err != nil {
+			return nil, err
+		}
+		env["COLLIE_AGENT_CONFIG_DIR"] = abs
+	}
+	// config.Resolve ignores a relative XDG_CONFIG_HOME, as the XDG spec says; pass it on only when it counts.
+	if v := getenv("XDG_CONFIG_HOME"); v != "" && filepath.IsAbs(v) {
+		env["XDG_CONFIG_HOME"] = v
+	}
+	return env, nil
 }

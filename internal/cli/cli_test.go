@@ -68,8 +68,8 @@ func collieServer(t *testing.T, heartbeatStatus *atomic.Int32) *httptest.Server 
 		switch r.URL.Path {
 		case "/oauth/device_authorization":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"device_code": "dev", "user_code": "BCDF-GHJK", "verification_uri": "http://collie.test/device",
-				"verification_uri_complete": "http://collie.test/device?user_code=BCDF-GHJK", "expires_in": 600, "interval": 5,
+				"device_code": "dev", "user_code": "BCDF-GHJK", "verification_uri": "https://collie.test/device",
+				"verification_uri_complete": "https://collie.test/device?user_code=BCDF-GHJK", "expires_in": 600, "interval": 5,
 				"name": r.PostForm.Get("name"),
 			})
 		case "/oauth/token":
@@ -99,10 +99,10 @@ func TestPairSavesCredentialsWith0600(t *testing.T) {
 	if code := h.run("pair", "--server", srv.URL); code != 0 {
 		t.Fatalf("pair = %d: %s", code, h.err)
 	}
-	if !strings.Contains(h.out.String(), "BCDF-GHJK") || !strings.Contains(h.out.String(), "http://collie.test/device") {
+	if !strings.Contains(h.out.String(), "BCDF-GHJK") || !strings.Contains(h.out.String(), "https://collie.test/device") {
 		t.Errorf("pair did not print the code and URL:\n%s", h.out)
 	}
-	if len(h.opened) != 1 || h.opened[0] != "http://collie.test/device?user_code=BCDF-GHJK" {
+	if len(h.opened) != 1 || h.opened[0] != "https://collie.test/device?user_code=BCDF-GHJK" {
 		t.Errorf("opened = %v", h.opened)
 	}
 	path := filepath.Join(h.base, "collie-agent", "credentials.json")
@@ -135,7 +135,7 @@ func TestPairNoBrowser(t *testing.T) {
 	if len(h.opened) != 0 {
 		t.Errorf("opened a browser: %v", h.opened)
 	}
-	if !strings.Contains(h.out.String(), "Or open http://collie.test/device?user_code=BCDF-GHJK") {
+	if !strings.Contains(h.out.String(), "Or open https://collie.test/device?user_code=BCDF-GHJK") {
 		t.Errorf("output:\n%s", h.out)
 	}
 }
@@ -310,5 +310,37 @@ func TestUsageAndVersion(t *testing.T) {
 	}
 	if code := h.run("status", "--profile"); code != exitUsage {
 		t.Errorf("--profile without a name = %d", code)
+	}
+}
+
+func TestServiceGetsAnAbsoluteConfigDir(t *testing.T) {
+	h := newHarness(t, "linux")
+	srv := collieServer(t, nil)
+	work := t.TempDir()
+	wd, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+	if err := os.Chdir(work); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("COLLIE_AGENT_CONFIG_DIR", "./config")
+	t.Setenv("XDG_CONFIG_HOME", "relative/xdg")
+	if code := h.run("pair", "--server", srv.URL); code != 0 {
+		t.Fatalf("pair = %d: %s", code, h.err)
+	}
+	if code := h.run("service", "install"); code != 0 {
+		t.Fatalf("service install = %d: %s", code, h.err)
+	}
+	unit, err := os.ReadFile(filepath.Join(h.home, ".config", "systemd", "user", "collie-agent.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	abs, _ := filepath.EvalSymlinks(work)
+	got := string(unit)
+	if !strings.Contains(got, `Environment="COLLIE_AGENT_CONFIG_DIR=`+filepath.Join(work, "config")+`"`) &&
+		!strings.Contains(got, `Environment="COLLIE_AGENT_CONFIG_DIR=`+filepath.Join(abs, "config")+`"`) {
+		t.Errorf("unit does not pass the absolute config dir:\n%s", got)
+	}
+	if strings.Contains(got, "XDG_CONFIG_HOME") {
+		t.Errorf("unit passes a relative XDG_CONFIG_HOME:\n%s", got)
 	}
 }

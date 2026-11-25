@@ -120,9 +120,15 @@ func (l *Launchd) Install(s Spec) error {
 	return nil
 }
 
-// Uninstall unloads the agent and deletes the plist.
+// Uninstall unloads the agent and deletes the plist. A label launchd does not know is already stopped; any other
+// bootout failure is returned before the plist is touched, so the CLI never says it removed an agent that still runs.
 func (l *Launchd) Uninstall() error {
-	_, _ = l.Run("launchctl", "bootout", l.domain()+"/"+l.Name())
+	target := l.domain() + "/" + l.Name()
+	if _, err := l.Run("launchctl", "print", target); err == nil {
+		if out, err := l.Run("launchctl", "bootout", target); err != nil {
+			return fmt.Errorf("launchctl bootout %s: %v: %s", target, err, out)
+		}
+	}
 	if err := os.Remove(l.Path()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}

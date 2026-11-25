@@ -399,3 +399,73 @@ func TestNewPicksTheOSManager(t *testing.T) {
 		t.Errorf("windows: %v", err)
 	}
 }
+
+func TestSystemdUninstallKeepsTheUnitWhenStopFails(t *testing.T) {
+	p := profile(t, "")
+	f := &fakeRun{answers: map[string]string{"systemctl --user disable --now collie-agent.service": "Failed to connect to bus"},
+		fail: map[string]bool{"systemctl --user disable --now collie-agent.service": true}}
+	d := &Systemd{ConfigHome: t.TempDir(), Run: f.run, Profile: p}
+	_ = writeFile(d.Path(), "[Unit]\n")
+	err := d.Uninstall()
+	if err == nil || !strings.Contains(err.Error(), "Failed to connect to bus") {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := os.Stat(d.Path()); err != nil {
+		t.Error("removed the unit although the service could not be stopped")
+	}
+}
+
+func TestSystemdUninstallReportsReloadFailure(t *testing.T) {
+	p := profile(t, "")
+	f := &fakeRun{fail: map[string]bool{"systemctl --user daemon-reload": true}}
+	d := &Systemd{ConfigHome: t.TempDir(), Run: f.run, Profile: p}
+	_ = writeFile(d.Path(), "[Unit]\n")
+	if err := d.Uninstall(); err == nil || !strings.Contains(err.Error(), "daemon-reload") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestSystemdUninstallWithoutUnitIsANoop(t *testing.T) {
+	p := profile(t, "")
+	f := &fakeRun{fail: map[string]bool{"systemctl --user disable --now collie-agent.service": true}}
+	d := &Systemd{ConfigHome: t.TempDir(), Run: f.run, Profile: p}
+	if err := d.Uninstall(); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("calls = %v", f.calls)
+	}
+}
+
+func TestLaunchdUninstallKeepsThePlistWhenBootoutFails(t *testing.T) {
+	p := profile(t, "")
+	target := "gui/501/sh.collies.collie-agent"
+	f := &fakeRun{answers: map[string]string{"launchctl bootout " + target: "Boot-out failed: 5: Input/output error"},
+		fail: map[string]bool{"launchctl bootout " + target: true}}
+	l := &Launchd{Home: t.TempDir(), UID: 501, Run: f.run, Profile: p}
+	_ = writeFile(l.Path(), "<plist/>")
+	err := l.Uninstall()
+	if err == nil || !strings.Contains(err.Error(), "Input/output error") {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := os.Stat(l.Path()); err != nil {
+		t.Error("removed the plist although the agent could not be stopped")
+	}
+}
+
+func TestLaunchdUninstallOfAnUnloadedAgent(t *testing.T) {
+	p := profile(t, "")
+	target := "gui/501/sh.collies.collie-agent"
+	f := &fakeRun{fail: map[string]bool{"launchctl print " + target: true}}
+	l := &Launchd{Home: t.TempDir(), UID: 501, Run: f.run, Profile: p}
+	_ = writeFile(l.Path(), "<plist/>")
+	if err := l.Uninstall(); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if strings.Contains(strings.Join(f.calls, "\n"), "bootout") {
+		t.Errorf("booted out an agent launchd does not know: %v", f.calls)
+	}
+	if _, err := os.Stat(l.Path()); !os.IsNotExist(err) {
+		t.Error("plist still there")
+	}
+}

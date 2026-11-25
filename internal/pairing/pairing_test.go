@@ -227,3 +227,79 @@ func assertWaits(t *testing.T, got []time.Duration, wantSeconds ...int) {
 		}
 	}
 }
+
+func TestPollBacksOffAfterServerErrorsKeepingSlowDown(t *testing.T) {
+	f := &fakeCollie{interval: 5, expiresIn: 600, tokenAnswers: []answer{
+		slowDown(),                 // next wait 10
+		{503, map[string]string{}}, // next wait 20
+		{502, map[string]string{}}, // next wait 40
+		pending(),
+		{200, map[string]any{"machine_id": 1, "machine_token": "t"}},
+	}}
+	if _, err, waits := run(t, f); err != nil {
+		t.Fatal(err)
+	} else {
+		assertWaits(t, waits, 5, 10, 20, 40, 40)
+	}
+}
+
+func TestPollBacksOffAfterTimeouts(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls <= 2 {
+			// Drop the connection without an answer, as a timeout or a reset would.
+			conn, _, _ := w.(http.Hijacker).Hijack()
+			conn.Close()
+			return
+		}
+		_, _ = w.Write([]byte(`{"machine_id": 3, "machine_token": "t"}`))
+	}))
+	defer srv.Close()
+	var waits []time.Duration
+	now := time.Now()
+	c := NewClient(srv.URL)
+	c.Now = func() time.Time { return now }
+	c.Sleep = func(_ context.Context, d time.Duration) error { waits = append(waits, d); now = now.Add(d); return nil }
+	res, err := c.Poll(context.Background(), &DeviceAuthorization{DeviceCode: "d", Interval: 5, ExpiresIn: 600})
+	if err != nil || res.MachineID != "3" {
+		t.Fatalf("Poll = %+v, %v", res, err)
+	}
+	assertWaits(t, waits, 5, 10, 20)
+}
+
+func TestBackOffIsCapped(t *testing.T) {
+	if got := backOff(45 * time.Second); got != maxInterval {
+		t.Errorf("backOff(45s) = %s", got)
+	}
+}
+
+func TestValidateVerificationURI(t *testing.T) {
+	for _, ok := range []string{"https://collies.sh/device", "https://collies.sh/device?user_code=BCDF-GHJK", "http://localhost:3000/device", "http://127.0.0.1/device"} {
+		if err := ValidateVerificationURI(ok); err != nil {
+			t.Errorf("%q: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "-a", "--help", "/etc/passwd", "file:///etc/passwd", "collie.test/device", "javascript:alert(1)",
+		"vscode://x", "http://collies.sh/device", "https://user:pw@collies.sh/device", "https:///device"} {
+		if ValidateVerificationURI(bad) == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+func TestAuthorizeRejectsUnsafeVerificationURIs(t *testing.T) {
+	for _, field := range []string{"verification_uri", "verification_uri_complete"} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			body := map[string]any{"device_code": "d", "user_code": "U", "verification_uri": "https://collie.test/device",
+				"verification_uri_complete": "https://collie.test/device?user_code=U", "expires_in": 600, "interval": 5}
+			body[field] = "file:///Applications/Calculator.app"
+			_ = json.NewEncoder(w).Encode(body)
+		}))
+		_, err := NewClient(srv.URL).Authorize(context.Background(), Machine{Name: "x"})
+		srv.Close()
+		if err == nil {
+			t.Errorf("%s: accepted a file URL", field)
+		}
+	}
+}
