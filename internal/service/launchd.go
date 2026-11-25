@@ -142,12 +142,13 @@ func (l *Launchd) Uninstall() error {
 // launchdNotFoundExit is launchctl's exit status for an unknown service (ESRCH as reported by launchctl: 113).
 const launchdNotFoundExit = 113
 
-// launchdNotFound reports whether launchctl failed because the job is not loaded, and nothing else.
+// launchdNotFound reports whether launchctl failed because the job is not loaded, and nothing else: exit 113, or
+// launchctl's own "Could not find service" message.
 func launchdNotFound(out string, err error) bool {
-	if exitCode(err) == launchdNotFoundExit {
-		return true
+	if err == nil {
+		return false
 	}
-	return strings.Contains(out, "Could not find service") || strings.Contains(out, "No such process")
+	return exitCode(err) == launchdNotFoundExit || strings.Contains(out, "Could not find service")
 }
 
 // Status asks launchctl print about the label.

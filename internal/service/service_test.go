@@ -32,15 +32,25 @@ type fakeRun struct {
 	calls   []string
 	answers map[string]string
 	fail    map[string]bool
+	// exits gives a failing command a real exit status (an *exec.ExitError), as launchctl and systemctl return.
+	exits map[string]int
 }
 
 func (f *fakeRun) run(name string, args ...string) (string, error) {
 	line := strings.Join(append([]string{name}, args...), " ")
 	f.calls = append(f.calls, line)
+	if code, ok := f.exits[line]; ok {
+		return f.answers[line], exitWith(code)
+	}
 	if f.fail[line] {
 		return f.answers[line], fmt.Errorf("exit status 3")
 	}
 	return f.answers[line], nil
+}
+
+// exitWith returns the *exec.ExitError of a real process that exits with code.
+func exitWith(code int) error {
+	return exec.Command("sh", "-c", fmt.Sprintf("exit %d", code)).Run()
 }
 
 // plistValue is a decoded property list value: string, bool, int (as string), []any or map[string]any.
@@ -430,17 +440,22 @@ func TestSystemdUninstallWithoutUnitFile(t *testing.T) {
 	cases := []struct {
 		name    string
 		out     string
-		fail    bool
+		exit    int // 0: the stop succeeds
 		wantErr bool
 	}{
-		{"still loaded and running: stopped", "", false, false},
-		{"not loaded: already stopped", "Failed to stop collie-agent.service: Unit collie-agent.service not loaded.", true, false},
-		{"manager error: reported", "Failed to connect to bus: No medium found", true, true},
+		{"still loaded and running: stopped", "", 0, false},
+		{"not loaded (exit 5): already stopped", "Failed to stop collie-agent.service: Unit collie-agent.service not loaded.", 5, false},
+		{"manager error: reported", "Failed to connect to bus: No medium found", 1, true},
+		{"'not loaded' text with another exit status: reported", "Job failed: unit not loaded", 1, true},
+		{"'not found' text with another exit status: reported", "Failed to stop: Unit not found", 4, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			p := profile(t, "")
-			f := &fakeRun{answers: map[string]string{stop: c.out}, fail: map[string]bool{stop: c.fail}}
+			f := &fakeRun{answers: map[string]string{stop: c.out}, exits: map[string]int{}}
+			if c.exit != 0 {
+				f.exits[stop] = c.exit
+			}
 			d := &Systemd{ConfigHome: t.TempDir(), Run: f.run, Profile: p}
 			err := d.Uninstall()
 			if (err != nil) != c.wantErr {
@@ -507,10 +522,43 @@ func TestLaunchdUninstallKeepsThePlistWhenTheLookupFails(t *testing.T) {
 
 func TestNotFoundDetectionUsesTheExitStatus(t *testing.T) {
 	run := func(code string) error { return exec.Command("sh", "-c", "exit "+code).Run() }
-	if !launchdNotFound("", run("113")) || launchdNotFound("", run("1")) {
+	if !launchdNotFound("", run("113")) || launchdNotFound("No such process", run("1")) || launchdNotFound("Could not find service", nil) {
 		t.Error("launchdNotFound does not follow launchctl's exit status 113")
 	}
-	if !systemdNotLoaded("", run("5")) || systemdNotLoaded("", run("1")) {
+	if !systemdNotLoaded("", run("5")) || systemdNotLoaded("Unit x.service not loaded.", run("1")) || systemdNotLoaded("not loaded", nil) {
 		t.Error("systemdNotLoaded does not follow systemctl's exit status 5")
+	}
+}
+
+func TestLaunchdUninstallKeepsThePlistOnNoSuchProcessWithAnotherExit(t *testing.T) {
+	for _, cmd := range []string{"print", "bootout"} {
+		t.Run(cmd, func(t *testing.T) {
+			p := profile(t, "")
+			target := "gui/501/sh.collies.collie-agent"
+			line := "launchctl " + cmd + " " + target
+			f := &fakeRun{answers: map[string]string{line: "Boot-out failed: 3: No such process"}, exits: map[string]int{line: 5}}
+			l := &Launchd{Home: t.TempDir(), UID: 501, Run: f.run, Profile: p}
+			_ = writeFile(l.Path(), "<plist/>")
+			if err := l.Uninstall(); err == nil {
+				t.Fatal("uninstall succeeded without launchd confirming the job is gone")
+			}
+			if _, err := os.Stat(l.Path()); err != nil {
+				t.Error("removed the plist")
+			}
+		})
+	}
+}
+
+func TestLaunchdUninstallAcceptsExit113(t *testing.T) {
+	p := profile(t, "")
+	target := "gui/501/sh.collies.collie-agent"
+	f := &fakeRun{exits: map[string]int{"launchctl print " + target: 113}}
+	l := &Launchd{Home: t.TempDir(), UID: 501, Run: f.run, Profile: p}
+	_ = writeFile(l.Path(), "<plist/>")
+	if err := l.Uninstall(); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if _, err := os.Stat(l.Path()); !os.IsNotExist(err) {
+		t.Error("plist still there")
 	}
 }

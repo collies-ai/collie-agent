@@ -117,12 +117,10 @@ func (d *Systemd) Uninstall() error {
 // systemdNotLoadedExit is systemctl's exit status for an unknown unit (LSB "program is not installed").
 const systemdNotLoadedExit = 5
 
-// systemdNotLoaded reports whether systemctl failed because the unit is not loaded, and nothing else.
-func systemdNotLoaded(out string, err error) bool {
-	if exitCode(err) == systemdNotLoadedExit {
-		return true
-	}
-	return strings.Contains(out, "not loaded") || strings.Contains(out, "not found")
+// systemdNotLoaded reports whether systemctl failed because the unit is not loaded, and nothing else. Only the exit
+// status counts: the output is free text that other failures can share.
+func systemdNotLoaded(_ string, err error) bool {
+	return exitCode(err) == systemdNotLoadedExit
 }
 
 // Status asks systemctl is-active about the unit.
