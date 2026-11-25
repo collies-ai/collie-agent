@@ -99,14 +99,45 @@ func addWorktree(ctx context.Context, repo, dir, branch string) error {
 		return err
 	}
 	_, addErr := git(ctx, repo, "worktree", "add", "-b", branch, dir, base)
-	// git can fail after it created the branch (a post-checkout hook that exits nonzero): the branch did not exist a
-	// moment ago, so if it exists now this session created it and owns its cleanup.
-	if addErr == nil || branchExists(ctx, repo, branch) {
+	// git can fail after it created the branch and the worktree (a post-checkout hook that exits nonzero, or a stop
+	// while it ran). The session owns the branch only if git registered this worktree on it: a branch someone else
+	// created in the meantime is never claimed. The check runs even when ctx was cancelled, so a stop does not orphan
+	// the branch.
+	if addErr == nil || ownsWorktree(repo, dir, branch) {
 		if err := write(worktreeMeta{Repo: repo, Branch: branch}); err != nil && addErr == nil {
 			return err
 		}
 	}
 	return addErr
+}
+
+// ownsWorktree reports whether git has dir registered as a worktree of repo on branch.
+func ownsWorktree(repo, dir, branch string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := git(ctx, repo, "worktree", "list", "--porcelain")
+	if err != nil {
+		return false
+	}
+	want := map[string]bool{dir: true}
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		want[real] = true
+	}
+	for _, block := range strings.Split(out, "\n\n") {
+		var path, ref string
+		for _, line := range strings.Split(block, "\n") {
+			if v, ok := strings.CutPrefix(line, "worktree "); ok {
+				path = v
+			}
+			if v, ok := strings.CutPrefix(line, "branch "); ok {
+				ref = v
+			}
+		}
+		if want[path] && ref == "refs/heads/"+branch {
+			return true
+		}
+	}
+	return false
 }
 
 func branchExists(ctx context.Context, repo, branch string) bool {

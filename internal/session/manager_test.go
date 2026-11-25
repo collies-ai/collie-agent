@@ -841,3 +841,45 @@ func TestABranchCreatedByAFailedWorktreeAddIsCleanedUp(t *testing.T) {
 		t.Errorf("the retry ran on %q", got)
 	}
 }
+
+// R3-1: a branch someone else created between the check and the add is never claimed.
+func TestABranchCreatedByAnotherProcessIsNotClaimed(t *testing.T) {
+	_, _, repo, _ := env(t)
+	dir := filepath.Join(t.TempDir(), "wt")
+	gitRun(t, repo, "branch", "collie/session-91") // as if created right after the existence check
+	if ownsWorktree(repo, dir, "collie/session-91") {
+		t.Fatal("a branch with no worktree at the session's path is claimed")
+	}
+	gitRun(t, repo, "worktree", "add", dir, "collie/session-91")
+	if !ownsWorktree(repo, dir, "collie/session-91") {
+		t.Error("the session's own worktree on its branch is not recognized")
+	}
+	if ownsWorktree(repo, dir, "main") {
+		t.Error("a worktree on another branch is claimed")
+	}
+}
+
+// R3-2: a stop while git runs, after it created the branch, still leaves the branch owned and cleaned up.
+func TestAStopAfterTheBranchIsCreatedDoesNotOrphanIt(t *testing.T) {
+	m, _, repo, _ := env(t)
+	marker := filepath.Join(t.TempDir(), "in-hook")
+	hook := filepath.Join(repo, ".git", "hooks", "post-checkout")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\ntouch '"+marker+"'\nsleep 5\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	sessionDir := filepath.Join(m.Dir, "92")
+	errc := make(chan error, 1)
+	go func() { errc <- addWorktree(ctx, repo, filepath.Join(sessionDir, "worktree"), "collie/session-92") }()
+	waitUntil(t, "git to run the hook", func() bool { _, err := os.Stat(marker); return err == nil })
+	cancel()
+	if err := <-errc; err == nil {
+		t.Fatal("addWorktree succeeded although it was stopped")
+	}
+	if err := removeWorktree(context.Background(), sessionDir); err != nil {
+		t.Logf("removeWorktree: %v", err)
+	}
+	if b := gitRun(t, repo, "branch", "--list", "collie/session-92"); b != "" {
+		t.Errorf("the branch created before the stop is orphaned: %q", b)
+	}
+}
