@@ -97,3 +97,29 @@ func TestHeartbeatReadsCodebasesVersion(t *testing.T) {
 		}
 	}
 }
+
+// The review an agent answered with travels with the finished event, as JSON; without one the field is left out.
+func TestSessionFinishedSendsTheReview(t *testing.T) {
+	var bodies []map[string]json.RawMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b map[string]json.RawMessage
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		bodies = append(bodies, b)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "tok", "test")
+	review := json.RawMessage(`{"verdict":"approve","summary":"ok","reason":"","findings":[]}`)
+	if err := c.SessionFinished(context.Background(), 7, 0, nil, review); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SessionFinished(context.Background(), 8, 0, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if string(bodies[0]["review"]) != string(review) {
+		t.Errorf("review sent = %s", bodies[0]["review"])
+	}
+	if _, ok := bodies[1]["review"]; ok {
+		t.Error("a finished event without a review sent the field")
+	}
+}

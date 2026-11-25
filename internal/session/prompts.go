@@ -18,6 +18,9 @@ var (
 	qaPrompt string
 	//go:embed prompts/reviewer.txt
 	reviewerPrompt string
+	// reviewSchema is the shape of a review agent's final answer, for agents that take one (codex --output-schema).
+	//go:embed prompts/review.schema.json
+	reviewSchema []byte
 )
 
 // PromptFor returns the fixed prompt for a purpose (code and research share the worker prompt, which handles

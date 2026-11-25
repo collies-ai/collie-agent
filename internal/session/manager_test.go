@@ -33,6 +33,7 @@ type fakeAPI struct {
 	startHold chan struct{} // when set, started events wait for it to close
 	finishErr []error       // returned by successive finished calls, then nil
 	usage     []*machine.Usage
+	reviews   []json.RawMessage
 }
 
 func (f *fakeAPI) RenewSessionToken(context.Context, int64) (time.Time, error) {
@@ -58,7 +59,7 @@ func (f *fakeAPI) SessionStarted(_ context.Context, _ int64, url string) error {
 	return nil
 }
 
-func (f *fakeAPI) SessionFinished(_ context.Context, _ int64, code int, usage *machine.Usage) error {
+func (f *fakeAPI) SessionFinished(_ context.Context, _ int64, code int, usage *machine.Usage, review json.RawMessage) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.finishErr) > 0 {
@@ -68,6 +69,7 @@ func (f *fakeAPI) SessionFinished(_ context.Context, _ int64, code int, usage *m
 	}
 	f.finished = append(f.finished, code)
 	f.usage = append(f.usage, usage)
+	f.reviews = append(f.reviews, review)
 	return nil
 }
 
@@ -115,6 +117,8 @@ if [ "$name" = claude ]; then
     if [ "$answer" != "$(printf '\033[B')" ]; then echo "refused: $answer" > "$out/trusted"; exit 7; fi
   fi
   echo trusted > "$out/trusted"
+  printf '%s\n%s' "$COLLIE_REVIEW_FILE" "$COLLIE_REVIEW_SCHEMA" > "$out/review_env"
+  if [ -n "$FAKE_REVIEW" ] && [ -n "$COLLIE_REVIEW_FILE" ]; then printf '%s' "$FAKE_REVIEW" > "$COLLIE_REVIEW_FILE"; fi
   if [ -n "$FAKE_ORPHAN" ]; then nohup sleep 60 >/dev/null 2>&1 & echo $! > "$out/orphan"; fi
   touch "$sdir/activity"
   printf 'Remote Control \033]8;;https://claude.ai/code/session_01TESTabc-_9\033\\/rc active\033]8;;\033\\\n'
@@ -130,6 +134,13 @@ if [ "$name" = claude ]; then
     exit 4
   fi
 else
+  outfile=""
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "-o" ]; then outfile="$a"; fi
+    prev="$a"
+  done
+  if [ -n "$FAKE_REVIEW" ] && [ -n "$outfile" ]; then printf '%s' "$FAKE_REVIEW" > "$outfile"; fi
   echo '{"type":"thread.started","thread_id":"t1"}'
   echo '{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":200,"output_tokens":300}}'
   echo 'not json'
@@ -1160,5 +1171,119 @@ func TestCodexGetsTheNetworkInsideItsWorkspaceSandbox(t *testing.T) {
 		if c.Args[len(c.Args)-1] != "p" {
 			t.Errorf("mode %q: the prompt is not the last argument: %q", mode, c.Args)
 		}
+	}
+}
+
+func reviewSession(id int64, agent, repo string) dispatch.Session {
+	s := session(id, agent, repo, "auto")
+	s.Dispatch.Purpose, s.Dispatch.Kind = "reviewer", "review"
+	s.Binding.Agents = map[string]string{"reviewer": agent}
+	return s
+}
+
+// The local config's session_setup runs in the worktree before the agent, with the session's details.
+func TestSessionSetupRunsInTheWorktreeBeforeTheAgent(t *testing.T) {
+	m, api, repo, out := env(t)
+	marker := filepath.Join(out, "setup")
+	m.Setup = map[string]string{"reviewer": `pwd -P > "` + marker + `"; echo "$COLLIE_PURPOSE $COLLIE_SESSION_ID $COLLIE_PROJECT $COLLIE_CODEBASE" >> "` + marker + `"`}
+	run(t, m, reviewSession(89, "codex", repo))
+	got := strings.Split(read(t, marker), "\n")
+	if got[0] != WorktreePath(repo, 89) || got[1] != "reviewer 89 collies collie" {
+		t.Errorf("setup saw %q", got)
+	}
+	if _, finished := api.snapshot(); len(finished) != 1 || finished[0] != 0 {
+		t.Errorf("finished = %v", finished)
+	}
+
+	// Another purpose has no setup: nothing runs.
+	_ = os.Remove(marker)
+	run(t, m, session(90, "codex", repo, "auto"))
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Error("the reviewer's setup ran for a code session")
+	}
+}
+
+func TestAFailingSessionSetupStopsTheSession(t *testing.T) {
+	m, api, repo, out := env(t)
+	m.Setup = map[string]string{"code": "echo no identity >&2; exit 3"}
+	run(t, m, session(91, "claude", repo, "auto"))
+	if _, err := os.Stat(filepath.Join(out, "claude")); !os.IsNotExist(err) {
+		t.Error("the agent ran although its setup failed")
+	}
+	if _, finished := api.snapshot(); len(finished) != 1 || finished[0] != -1 {
+		t.Errorf("finished = %v, want -1", finished)
+	}
+}
+
+// A codex review answers in the review schema; collie-agent sends that answer with the finished event.
+func TestACodexReviewSendsItsStructuredAnswer(t *testing.T) {
+	m, api, repo, out := env(t)
+	review := `{"verdict":"changes_requested","summary":"Read x.go, ran go test.","reason":"","findings":[{"pr_number":9,"path":"x.go","line":3,"blocking":true,"severity":"major","origin":"new","body":"off by one"}]}`
+	t.Setenv("FAKE_REVIEW", review)
+	run(t, m, reviewSession(92, "codex", repo))
+	args := read(t, filepath.Join(out, "codex", "args"))
+	for _, want := range []string{"--output-schema\n" + filepath.Join(m.Dir, "92", "review.schema.json"), "-o\n" + filepath.Join(m.Dir, "92", ReviewFile)} {
+		if !strings.Contains(args, want) {
+			t.Errorf("codex args lack %q:\n%s", want, args)
+		}
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.reviews) != 1 || !json.Valid(api.reviews[0]) || !strings.Contains(string(api.reviews[0]), `"verdict":"changes_requested"`) {
+		t.Errorf("reviews sent = %q", api.reviews)
+	}
+}
+
+func TestAnInvalidReviewAnswerIsNotSent(t *testing.T) {
+	m, api, repo, _ := env(t)
+	t.Setenv("FAKE_REVIEW", `{"verdict":"looks fine"}`)
+	run(t, m, reviewSession(93, "codex", repo))
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.reviews) != 1 || api.reviews[0] != nil {
+		t.Errorf("reviews sent = %q, want none", api.reviews)
+	}
+}
+
+func TestOnlyReviewsGetTheReviewSchema(t *testing.T) {
+	for purpose, want := range map[string]bool{"reviewer": true, "code": false, "research": false} {
+		c, err := (Codex{}).Command(Launch{Purpose: purpose, TokenEnv: TokenEnv, SessionDir: t.TempDir(), Prompt: "p"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Contains(strings.Join(c.Args, " "), "--output-schema"); got != want {
+			t.Errorf("purpose %s: output schema %v, want %v", purpose, got, want)
+		}
+		if c.Args[len(c.Args)-1] != "p" {
+			t.Errorf("purpose %s: the prompt is not last: %q", purpose, c.Args)
+		}
+	}
+	if !json.Valid(reviewSchema) {
+		t.Error("the embedded review schema is not valid JSON")
+	}
+}
+
+// A Claude review gets the same review file and schema through the environment, and its answer is sent too.
+func TestAClaudeReviewWritesItsAnswerToTheReviewFile(t *testing.T) {
+	m, api, repo, out := env(t)
+	t.Setenv("FAKE_REVIEW", `{"verdict":"approve","summary":"Read it all.","reason":"","findings":[]}`)
+	run(t, m, reviewSession(94, "claude", repo))
+	got := strings.Split(read(t, filepath.Join(out, "claude", "review_env")), "\n")
+	if want := []string{filepath.Join(m.Dir, "94", ReviewFile), filepath.Join(m.Dir, "94", "review.schema.json")}; strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("review env = %q, want %q", got, want)
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.reviews) != 1 || !strings.Contains(string(api.reviews[0]), `"verdict":"approve"`) {
+		t.Errorf("reviews sent = %q", api.reviews)
+	}
+}
+
+// A code session gets no review file.
+func TestOnlyReviewSessionsGetTheReviewFile(t *testing.T) {
+	m, _, repo, out := env(t)
+	run(t, m, session(95, "claude", repo, "auto"))
+	if got := read(t, filepath.Join(out, "claude", "review_env")); got != "" {
+		t.Errorf("a code session got the review env %q", got)
 	}
 }

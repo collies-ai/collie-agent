@@ -26,6 +26,10 @@ type Settings struct {
 	// PermissionMode, when set, is the permission mode of every binding on this machine, whatever collie says: auto,
 	// full or plan. A binding's pin can still set its own.
 	PermissionMode string `json:"permission_mode,omitempty"`
+	// SessionSetup runs a command in a session's worktree before its agent starts, by the dispatch's purpose (code,
+	// research, reviewer, qa-browser): e.g. give the reviewer its own git and GitHub identity. A command that fails
+	// stops the session before the agent runs.
+	SessionSetup map[string]string `json:"session_setup,omitempty"`
 	// Bindings pins or overrides collie's bindings, matched by runner_id or by project + codebase (+ purpose).
 	Bindings []PinnedBinding `json:"bindings,omitempty"`
 }

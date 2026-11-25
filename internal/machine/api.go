@@ -207,11 +207,15 @@ func (c *Client) SessionStarted(ctx context.Context, sessionID int64, sessionURL
 	return sessionError(c.do(ctx, http.MethodPost, fmt.Sprintf("/machine/v1/sessions/%d/events", sessionID), body, nil))
 }
 
-// SessionFinished reports that the agent process ended, with its exit code and, when known, its usage.
-func (c *Client) SessionFinished(ctx context.Context, sessionID int64, exitCode int, usage *Usage) error {
+// SessionFinished reports that the agent process ended, with its exit code and, when known, its usage and the
+// review the agent answered with (a review session whose agent takes an output schema).
+func (c *Client) SessionFinished(ctx context.Context, sessionID int64, exitCode int, usage *Usage, review json.RawMessage) error {
 	body := map[string]any{"event": "finished", "exit_code": exitCode}
 	if usage != nil {
 		body["usage"] = usage
+	}
+	if len(review) > 0 {
+		body["review"] = review
 	}
 	return sessionError(c.do(ctx, http.MethodPost, fmt.Sprintf("/machine/v1/sessions/%d/events", sessionID), body, nil))
 }
