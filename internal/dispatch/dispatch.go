@@ -234,11 +234,17 @@ func (d *Dispatcher) reserve(key int64, m machine.Dispatch) (string, bindings.Bi
 }
 
 // agentFor picks the binding's agent for a purpose; "code" is collie's default purpose.
+// agentFor is the binding's agent for the dispatch's purpose. Research with no research agent of its own runs on the
+// code agent: collie offers research to a codebase's code bindings when it has no research binding (RunnerPool), and
+// the worker prompt takes "collie research #N".
 func agentFor(b bindings.Binding, purpose string) string {
 	if purpose == "" {
 		purpose = "code"
 	}
-	return b.Agents[purpose]
+	if agent := b.Agents[purpose]; agent != "" || purpose != "research" {
+		return agent
+	}
+	return b.Agents["code"]
 }
 
 func (d *Dispatcher) release(key int64) {
