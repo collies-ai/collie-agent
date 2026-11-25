@@ -193,7 +193,11 @@ func (m *Manager) run(ctx context.Context, s dispatch.Session, a Adapter, binary
 	defer func() {
 		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		if err := removeWorktree(cctx, dir); err != nil {
+		stopped, err := removeWorktree(cctx, dir)
+		if stopped > 0 {
+			m.logf("session %d: stopped %d process(es) still running in its worktree", s.ID, stopped)
+		}
+		if err != nil {
 			m.logf("session %d: removing the worktree: %v", s.ID, err)
 		}
 	}()
