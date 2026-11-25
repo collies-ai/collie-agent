@@ -264,6 +264,15 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 	cmd.Dir = worktree
 	cmd.Env = append(os.Environ(), spec.Env...)
 	cmd.Env = append(cmd.Env, TokenEnv+"="+s.Accepted.SessionToken, "COLLIE_MCP_URL="+mcpURL(s))
+	if s.Dispatch.Purpose == "reviewer" {
+		// Whatever the agent, a review can answer in collie's review shape: collie's review steps tell it to write the
+		// verdict to COLLIE_REVIEW_FILE (codex is also held to it by --output-schema), and readReview sends it.
+		schema, err := writeReviewSchema(dir)
+		if err != nil {
+			return -1, nil, err
+		}
+		cmd.Env = append(cmd.Env, "COLLIE_REVIEW_FILE="+filepath.Join(dir, ReviewFile), "COLLIE_REVIEW_SCHEMA="+schema)
+	}
 	var (
 		out   io.Reader
 		tty   *os.File       // the terminal of an interactive agent
@@ -543,6 +552,15 @@ func (m *Manager) setup(ctx context.Context, s dispatch.Session, worktree string
 		return fmt.Errorf("session_setup for %s failed: %v: %s", s.Dispatch.Purpose, err, tail)
 	}
 	return nil
+}
+
+// writeReviewSchema writes the review shape to the session dir and returns its path.
+func writeReviewSchema(dir string) (string, error) {
+	schema := filepath.Join(dir, "review.schema.json")
+	if err := os.WriteFile(schema, reviewSchema, 0o600); err != nil {
+		return "", fmt.Errorf("writing the review schema: %w", err)
+	}
+	return schema, nil
 }
 
 // readReview returns the review the agent answered with (ReviewFile), when it wrote one with a known verdict.

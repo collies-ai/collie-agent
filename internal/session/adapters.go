@@ -308,12 +308,13 @@ func (Codex) Command(l Launch) (Command, error) {
 		// listen on localhost and gh (a review's comment on the PR) fail. Writes stay inside the worktree.
 		network = []string{"-c", "sandbox_workspace_write.network_access=true"}
 	}
-	// A review answers with the review itself (ReviewFile), in the shape collie takes: codex enforces it.
+	// A review answers with the review itself (ReviewFile), in the shape collie takes: codex enforces it. Any agent is
+	// also told where to write it (COLLIE_REVIEW_FILE, set by the manager).
 	var review []string
 	if l.Purpose == "reviewer" {
-		schema := filepath.Join(l.SessionDir, "review.schema.json")
-		if err := os.WriteFile(schema, reviewSchema, 0o600); err != nil {
-			return Command{}, fmt.Errorf("writing the review schema: %w", err)
+		schema, err := writeReviewSchema(l.SessionDir)
+		if err != nil {
+			return Command{}, err
 		}
 		review = []string{"--output-schema", schema, "-o", filepath.Join(l.SessionDir, ReviewFile)}
 	}

@@ -117,6 +117,8 @@ if [ "$name" = claude ]; then
     if [ "$answer" != "$(printf '\033[B')" ]; then echo "refused: $answer" > "$out/trusted"; exit 7; fi
   fi
   echo trusted > "$out/trusted"
+  printf '%s\n%s' "$COLLIE_REVIEW_FILE" "$COLLIE_REVIEW_SCHEMA" > "$out/review_env"
+  if [ -n "$FAKE_REVIEW" ] && [ -n "$COLLIE_REVIEW_FILE" ]; then printf '%s' "$FAKE_REVIEW" > "$COLLIE_REVIEW_FILE"; fi
   if [ -n "$FAKE_ORPHAN" ]; then nohup sleep 60 >/dev/null 2>&1 & echo $! > "$out/orphan"; fi
   touch "$sdir/activity"
   printf 'Remote Control \033]8;;https://claude.ai/code/session_01TESTabc-_9\033\\/rc active\033]8;;\033\\\n'
@@ -1258,5 +1260,30 @@ func TestOnlyReviewsGetTheReviewSchema(t *testing.T) {
 	}
 	if !json.Valid(reviewSchema) {
 		t.Error("the embedded review schema is not valid JSON")
+	}
+}
+
+// A Claude review gets the same review file and schema through the environment, and its answer is sent too.
+func TestAClaudeReviewWritesItsAnswerToTheReviewFile(t *testing.T) {
+	m, api, repo, out := env(t)
+	t.Setenv("FAKE_REVIEW", `{"verdict":"approve","summary":"Read it all.","reason":"","findings":[]}`)
+	run(t, m, reviewSession(94, "claude", repo))
+	got := strings.Split(read(t, filepath.Join(out, "claude", "review_env")), "\n")
+	if want := []string{filepath.Join(m.Dir, "94", ReviewFile), filepath.Join(m.Dir, "94", "review.schema.json")}; strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("review env = %q, want %q", got, want)
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.reviews) != 1 || !strings.Contains(string(api.reviews[0]), `"verdict":"approve"`) {
+		t.Errorf("reviews sent = %q", api.reviews)
+	}
+}
+
+// A code session gets no review file.
+func TestOnlyReviewSessionsGetTheReviewFile(t *testing.T) {
+	m, _, repo, out := env(t)
+	run(t, m, session(95, "claude", repo, "auto"))
+	if got := read(t, filepath.Join(out, "claude", "review_env")); got != "" {
+		t.Errorf("a code session got the review env %q", got)
 	}
 }

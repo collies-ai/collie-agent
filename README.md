@@ -125,9 +125,11 @@ instead.
     interactive session does not exit on its own: hooks mark when it works and when it waits, and once it has waited
     15 minutes with nothing to do collie-agent types `/exit`. Claude reports its own usage to collie;
   - **Codex** runs headless (`codex exec --json`), and the token usage of its turns goes to collie with the session's
-    end. A review asks Codex for its final answer in collie's review shape (`--output-schema`: verdict, summary, reason and
-    findings with file, line, whether it blocks, severity and origin); collie-agent checks it and sends it to collie with
-    the session's end;
+    end;
+  - a review session, whatever its agent, gets `COLLIE_REVIEW_FILE` and `COLLIE_REVIEW_SCHEMA`: where to write its verdict
+    in collie's review shape (verdict, summary, reason and findings with file, line, whether it blocks, severity and
+    origin), as collie's review steps ask. Codex is also held to that shape (`--output-schema` / `-o`). collie-agent
+    checks the answer and sends it to collie with the session's end;
   - output goes to `<profile dir>/sessions/<id>/agent.log`, next to the session's private files (MCP config, hooks). When the agent exits (or the token dies, or the service
     stops, which stops it) collie-agent reports the exit code, stops the processes still running in the worktree (whatever the agent left outside its process group, such as a `nohup … &` or a dev server that daemonizes: SIGTERM, then SIGKILL after 5 seconds) and removes the worktree and the branch it created.
     Leftover worktrees from a crash are removed when `run` starts. Lifecycle reports never hold the agent up.
