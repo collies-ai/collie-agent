@@ -59,21 +59,24 @@ type Dispatcher struct {
 	// MaxConcurrency is the machine-wide limit of sessions at once.
 	MaxConcurrency int
 
-	mu       sync.Mutex
-	bindings map[int64]bindings.Binding // by runner id
-	running  map[int64]int64            // session id → runner id
-	reserved map[int64]int64            // offers being acked: session id → runner id
-	handled  map[int64]bool             // offer (session) ids already handled, so the cable and the long-poll don't ack twice
+	mu          sync.Mutex
+	bindings    map[int64]bindings.Binding // by runner id
+	running     map[int64]int64            // session id → runner id
+	reserved    map[int64]int64            // offers being acked: session id → runner id
+	handled     map[int64]bool             // offer (session) ids already handled, so the cable and the long-poll don't ack twice
+	rootFolders []string
 }
 
-// SetBindings replaces the bindings the dispatcher accepts offers for.
-func (d *Dispatcher) SetBindings(bs []bindings.Binding) {
+// SetBindings replaces the bindings the dispatcher accepts offers for, and the root folders their folders must stay
+// inside (checked again on every offer).
+func (d *Dispatcher) SetBindings(bs []bindings.Binding, roots []string) {
 	m := make(map[int64]bindings.Binding, len(bs))
 	for _, b := range bs {
 		m[b.RunnerID] = b
 	}
 	d.mu.Lock()
 	d.bindings = m
+	d.rootFolders = append([]string(nil), roots...)
 	d.mu.Unlock()
 }
 
@@ -116,16 +119,17 @@ func (d *Dispatcher) Handle(ctx context.Context, m machine.Dispatch) error {
 		return nil
 	}
 	if reason != "" {
-		d.logf("declining dispatch %d (%s %s): %s", m.DispatchID, m.Kind, m.Reference, reason)
-		_, err := d.API.Ack(ctx, m.DispatchID, false, reason)
-		if errors.Is(err, machine.ErrRevoked) {
-			return err
-		}
-		if err != nil && !errors.Is(err, machine.ErrGone) {
-			d.logf("declining dispatch %d: %v", m.DispatchID, err)
-		}
-		return nil
+		return d.decline(ctx, key, m, reason)
 	}
+
+	// The folder was checked when the bindings synced; check it again now, so a folder (or an ancestor) swapped for
+	// a symlink since then cannot send the session outside the root folders. The session gets the fresh path.
+	folder, err := bindings.Within(b.Folder, d.roots())
+	if err != nil {
+		d.release(key)
+		return d.decline(ctx, key, m, "binding refused by the machine: "+err.Error())
+	}
+	b.Folder = folder
 
 	acc, err := d.API.Ack(ctx, m.DispatchID, true, "")
 	if err != nil {
@@ -153,6 +157,29 @@ func (d *Dispatcher) Handle(ctx context.Context, m machine.Dispatch) error {
 		d.finish(sid)
 	}
 	return nil
+}
+
+// decline sends a decline. A failure collie may never have seen (network, 5xx) forgets the offer, so a redelivery
+// is declined again instead of dropped as a duplicate.
+func (d *Dispatcher) decline(ctx context.Context, key int64, m machine.Dispatch, reason string) error {
+	d.logf("declining dispatch %d (%s %s): %s", m.DispatchID, m.Kind, m.Reference, reason)
+	_, err := d.API.Ack(ctx, m.DispatchID, false, reason)
+	switch {
+	case err == nil, errors.Is(err, machine.ErrGone):
+		return nil
+	case errors.Is(err, machine.ErrRevoked):
+		return err
+	default:
+		d.logf("declining dispatch %d: %v", m.DispatchID, err)
+		d.forget(key)
+		return nil
+	}
+}
+
+func (d *Dispatcher) roots() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.rootFolders
 }
 
 // reserve checks an offer and, when it can be accepted, reserves a slot for it while it is acked. It returns a

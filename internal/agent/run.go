@@ -81,9 +81,11 @@ type Runner struct {
 	ScanRepos  func(roots []string) []discovery.Repo
 
 	dispatcher *dispatch.Dispatcher
-	stateMu    sync.Mutex
-	state      *config.State
-	agents     []machine.Agent
+	// stop ends the whole Loop with err (a revocation found anywhere, including a late ack after a reconnect).
+	stop    func(err error)
+	stateMu sync.Mutex
+	state   *config.State
+	agents  []machine.Agent
 }
 
 func (r *Runner) sleep(ctx context.Context, d time.Duration) error {
@@ -171,15 +173,21 @@ func (r *Runner) Loop(ctx context.Context) error {
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	fatal := make(chan error, 4)
+	fatal := make(chan error, 1)
+	r.stop = func(err error) {
+		select {
+		case fatal <- err:
+		default: // the first error wins
+		}
+		cancel()
+	}
 	var wg sync.WaitGroup
 	start := func(f func(context.Context) error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			if err := f(ctx); err != nil {
-				fatal <- err
-				cancel()
+				r.stop(err)
 			}
 		}()
 	}
@@ -309,7 +317,7 @@ func (r *Runner) syncBindings(ctx context.Context) error {
 		return err
 	}
 	resolved := bindings.Resolve(server, r.settings())
-	r.dispatcher.SetBindings(resolved)
+	r.dispatcher.SetBindings(resolved, r.settings().RootFolders)
 	states := make([]config.BindingState, 0, len(resolved))
 	for _, b := range resolved {
 		if !b.Usable() {
@@ -364,7 +372,6 @@ func (r *Runner) connectionLoop(ctx context.Context) error {
 	for {
 		if r.Cable != nil {
 			subscribedAt := time.Time{}
-			errs := make(chan error, 1)
 			cableCtx, stopCable := context.WithCancel(ctx)
 			err := r.Cable.Run(cableCtx, func() {
 				subscribedAt = r.now()
@@ -372,22 +379,15 @@ func (r *Runner) connectionLoop(ctx context.Context) error {
 				r.logger().Print("connected to collie over the cable")
 			}, func(d machine.Dispatch) {
 				// Ack outside the read loop: an ack is an HTTP call and the cable must keep reading pings.
+				// The ack runs on the runner's context, so it can outlive this socket: a revocation it finds stops the
+				// whole runner, not just this connection.
 				go func() {
 					if err := r.dispatcher.Handle(ctx, d); err != nil {
-						select {
-						case errs <- err:
-						default:
-						}
-						stopCable() // revoked: stop reading the cable now, not at the next heartbeat
+						r.stop(err)
 					}
 				}()
 			})
 			stopCable()
-			select {
-			case e := <-errs:
-				return e
-			default:
-			}
 			if ctx.Err() != nil {
 				return nil
 			}

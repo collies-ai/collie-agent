@@ -436,3 +436,51 @@ func fmtSscan(s string, id *int64) (int, error) {
 	*id = n
 	return 1, nil
 }
+
+// dropCable delivers one offer and then drops the connection right away, before the ack comes back.
+type dropCable struct{ offered sync.Once }
+
+func (c *dropCable) Run(ctx context.Context, onSubscribed func(), onDispatch func(machine.Dispatch)) error {
+	onSubscribed()
+	c.offered.Do(func() { onDispatch(offerFor(1, 11)) })
+	return errors.New("socket closed")
+}
+
+// slowRevokedAck is a Remote whose ack answers 401 after the cable has already moved on.
+type slowRevokedAck struct {
+	*machine.Client
+}
+
+func (s slowRevokedAck) Ack(ctx context.Context, id int64, accept bool, reason string) (*machine.Accepted, error) {
+	select {
+	case <-time.After(150 * time.Millisecond):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return nil, machine.ErrRevoked
+}
+
+func (s slowRevokedAck) PollDispatches(ctx context.Context, wait time.Duration) ([]machine.Dispatch, error) {
+	select {
+	case <-time.After(50 * time.Millisecond):
+	case <-ctx.Done():
+	}
+	return nil, nil
+}
+
+func TestALateRevokedAckStopsTheRunnerAfterAReconnect(t *testing.T) {
+	f := newFakeCollie(t)
+	r, _, _ := setup(t, f)
+	r.Remote = slowRevokedAck{machine.NewClient(f.srv.URL, "tok", "test")}
+	r.Cable = &dropCable{}
+	done := make(chan error, 1)
+	go func() { done <- r.Loop(context.Background()) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, machine.ErrRevoked) {
+			t.Fatalf("Loop = %v, want ErrRevoked", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a 401 from an ack that finished after the cable reconnected did not stop the runner")
+	}
+}

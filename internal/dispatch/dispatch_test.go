@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -67,6 +69,26 @@ func binding(runner int64, folder string, max int) bindings.Binding {
 		Folder: folder, Agents: map[string]string{"code": "claude", "reviewer": "codex"}, MaxConcurrency: max}}
 }
 
+// setBindings creates each "/code/..." folder under a temporary root folder and gives the dispatcher the bindings
+// with those real paths, plus that root. Other folders (e.g. /etc) are left as they are.
+func setBindings(t *testing.T, d *Dispatcher, bs []bindings.Binding) string {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range bs {
+		if rest, ok := strings.CutPrefix(bs[i].Folder, "/code/"); ok {
+			bs[i].Folder = filepath.Join(root, rest)
+			if err := os.MkdirAll(bs[i].Folder, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	d.SetBindings(bs, []string{root})
+	return root
+}
+
 func offer(id, runner int64) machine.Dispatch {
 	return machine.Dispatch{Type: "dispatch", DispatchID: id, SessionID: id + 1000, RunnerID: runner, Kind: "work_goal", Purpose: "code", Reference: "collie work_goal #148"}
 }
@@ -75,7 +97,7 @@ func TestAcceptsUpToCapacityThenDeclines(t *testing.T) {
 	api := &fakeAPI{}
 	sess := &fakeSessions{}
 	d := &Dispatcher{API: api, Sessions: sess, MaxConcurrency: 2}
-	d.SetBindings([]bindings.Binding{binding(1, "/code/collie", 1), binding(2, "/code/agent", 5)})
+	setBindings(t, d, []bindings.Binding{binding(1, "/code/collie", 1), binding(2, "/code/agent", 5)})
 	ctx := context.Background()
 
 	_ = d.Handle(ctx, offer(1, 1)) // accepted: binding 1 now full
@@ -92,7 +114,7 @@ func TestAcceptsUpToCapacityThenDeclines(t *testing.T) {
 	if fmt.Sprint(api.acks) != fmt.Sprint(want) {
 		t.Fatalf("acks = %+v\nwant %+v", api.acks, want)
 	}
-	if len(sess.started) != 2 || sess.started[0].Agent != "claude" || sess.started[0].ID != 100 || sess.started[0].Binding.Folder != "/code/collie" {
+	if len(sess.started) != 2 || sess.started[0].Agent != "claude" || sess.started[0].ID != 100 || !strings.HasSuffix(sess.started[0].Binding.Folder, "/collie") {
 		t.Errorf("started = %+v", sess.started)
 	}
 	if got := d.Running(); fmt.Sprint(got) != "[100 300]" {
@@ -125,7 +147,7 @@ func TestDeclineReasons(t *testing.T) {
 			api := &fakeAPI{}
 			sess := &fakeSessions{refuse: "codex"}
 			d := &Dispatcher{API: api, Sessions: sess, MaxConcurrency: 4}
-			d.SetBindings([]bindings.Binding{binding(1, "/code/collie", 2), refused})
+			setBindings(t, d, []bindings.Binding{binding(1, "/code/collie", 2), refused})
 			if err := d.Handle(context.Background(), c.offer); err != nil {
 				t.Fatal(err)
 			}
@@ -142,7 +164,7 @@ func TestDeclineReasons(t *testing.T) {
 func TestWithoutASessionRunnerEveryOfferIsDeclined(t *testing.T) {
 	api := &fakeAPI{}
 	d := &Dispatcher{API: api, Sessions: Unsupported{}, MaxConcurrency: 2}
-	d.SetBindings([]bindings.Binding{binding(1, "/code/collie", 1)})
+	setBindings(t, d, []bindings.Binding{binding(1, "/code/collie", 1)})
 	_ = d.Handle(context.Background(), offer(1, 1))
 	if len(api.acks) != 1 || api.acks[0].Accept || !strings.Contains(api.acks[0].Reason, "cannot run sessions yet") {
 		t.Errorf("acks = %+v", api.acks)
@@ -153,7 +175,7 @@ func TestTheSameOfferIsAckedOnce(t *testing.T) {
 	// The cable replays pending offers on subscribe and the long-poll may serve them too.
 	api := &fakeAPI{}
 	d := &Dispatcher{API: api, Sessions: &fakeSessions{}, MaxConcurrency: 2}
-	d.SetBindings([]bindings.Binding{binding(1, "/code/collie", 2)})
+	setBindings(t, d, []bindings.Binding{binding(1, "/code/collie", 2)})
 	var wg sync.WaitGroup
 	for range 5 {
 		wg.Add(1)
@@ -176,7 +198,7 @@ func TestConcurrentOffersNeverExceedCapacity(t *testing.T) {
 	api := &fakeAPI{}
 	sess := &fakeSessions{}
 	d := &Dispatcher{API: api, Sessions: sess, MaxConcurrency: 3}
-	d.SetBindings([]bindings.Binding{binding(1, "/code/collie", 10)})
+	setBindings(t, d, []bindings.Binding{binding(1, "/code/collie", 10)})
 	var wg sync.WaitGroup
 	for i := range 20 {
 		wg.Add(1)
@@ -198,7 +220,7 @@ func TestGoneAndRevoked(t *testing.T) {
 	api := &fakeAPI{err: map[int64]error{1: fmt.Errorf("%w: expired", machine.ErrGone), 2: machine.ErrRevoked, 3: errors.New("network down")}}
 	sess := &fakeSessions{}
 	d := &Dispatcher{API: api, Sessions: sess, MaxConcurrency: 2}
-	d.SetBindings([]bindings.Binding{binding(1, "/code/collie", 2)})
+	setBindings(t, d, []bindings.Binding{binding(1, "/code/collie", 2)})
 	ctx := context.Background()
 	if err := d.Handle(ctx, offer(1, 1)); err != nil {
 		t.Errorf("gone: %v", err)
@@ -217,5 +239,67 @@ func TestGoneAndRevoked(t *testing.T) {
 	_ = d.Handle(ctx, offer(3, 1))
 	if len(sess.started) != 1 {
 		t.Error("the retried offer was not accepted")
+	}
+}
+
+func TestAFailedDeclineIsRetriedOnRedelivery(t *testing.T) {
+	api := &fakeAPI{err: map[int64]error{1: errors.New("connection reset")}}
+	d := &Dispatcher{API: api, Sessions: &fakeSessions{}, MaxConcurrency: 2}
+	setBindings(t, d, []bindings.Binding{binding(1, "/code/collie", 1)})
+	o := offer(1, 9) // runner 9 is not bound: declined
+	_ = d.Handle(context.Background(), o)
+	delete(api.err, 1)
+	_ = d.Handle(context.Background(), o) // collie redelivers the same offer
+	if len(api.acks) != 2 || api.acks[1].Accept || api.acks[1].Reason != "runner 9 is not bound on this machine" {
+		t.Errorf("acks = %+v, want the decline sent again", api.acks)
+	}
+	// A decline collie did get (or one that is gone) is not sent again.
+	_ = d.Handle(context.Background(), o)
+	if len(api.acks) != 2 {
+		t.Errorf("acks = %+v after a successful decline", api.acks)
+	}
+}
+
+func TestFolderIsCheckedAgainOnEveryOffer(t *testing.T) {
+	api := &fakeAPI{}
+	sess := &fakeSessions{}
+	d := &Dispatcher{API: api, Sessions: sess, MaxConcurrency: 4}
+	bs := []bindings.Binding{binding(1, "/code/collie", 4)}
+	root := setBindings(t, d, bs)
+	folder := filepath.Join(root, "collie")
+	outside, _ := filepath.EvalSymlinks(t.TempDir())
+
+	_ = d.Handle(context.Background(), offer(1, 1))
+	if len(sess.started) != 1 || sess.started[0].Binding.Folder != folder {
+		t.Fatalf("first offer: started = %+v", sess.started)
+	}
+
+	// After the sync, the folder is replaced with a symlink that leads outside the root folders.
+	if err := os.RemoveAll(folder); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, folder); err != nil {
+		t.Fatal(err)
+	}
+	_ = d.Handle(context.Background(), offer(2, 1))
+	last := api.acks[len(api.acks)-1]
+	if last.Accept || !strings.Contains(last.Reason, "outside the root folders") {
+		t.Errorf("offer after the swap: %+v", last)
+	}
+	if len(sess.started) != 1 {
+		t.Errorf("a session started in a folder outside the roots: %+v", sess.started[1:])
+	}
+	if got := d.Running(); len(got) != 1 {
+		t.Errorf("the refused offer kept a slot: running = %v", got)
+	}
+
+	// An ancestor swapped for a symlink inside the roots still resolves: the session gets the real path.
+	_ = os.Remove(folder)
+	real := filepath.Join(root, "real-collie")
+	_ = os.MkdirAll(real, 0o755)
+	_ = os.Symlink(real, folder)
+	_ = d.Handle(context.Background(), offer(3, 1))
+	if len(sess.started) != 2 || sess.started[1].Binding.Folder != real {
+		t.Errorf("started = %+v, want the resolved %s", sess.started, real)
 	}
 }
