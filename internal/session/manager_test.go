@@ -188,6 +188,20 @@ else
     prev="$a"
   done
   if [ -n "$FAKE_REVIEW" ] && [ -n "$outfile" ]; then printf '%s' "$FAKE_REVIEW" > "$outfile"; fi
+  # What a real codex would expose: the MCP servers of $CODEX_HOME/config.toml (unless --ignore-user-config) plus those
+  # set with -c mcp_servers.<name>.*, and its shell (unless --disable shell_tool).
+  ignore_user=""; no_shell=""; servers=""; prev=""
+  for a in "$@"; do
+    [ "$a" = --ignore-user-config ] && ignore_user=1
+    [ "$prev" = --disable ] && [ "$a" = shell_tool ] && no_shell=1
+    if [ "$prev" = -c ]; then case "$a" in mcp_servers.*) n=${a#mcp_servers.}; servers="$servers ${n%%.*}";; esac; fi
+    prev="$a"
+  done
+  if [ -z "$ignore_user" ] && [ -f "$CODEX_HOME/config.toml" ]; then
+    servers="$servers $(sed -n 's/^\[mcp_servers\.\([^].]*\)\]$/\1/p' "$CODEX_HOME/config.toml")"
+  fi
+  printf '%s\n' $servers | sort -u | grep -v '^$' > "$out/mcp_servers"
+  if [ -z "$no_shell" ]; then echo shell > "$out/tools"; else : > "$out/tools"; fi
   if [ -n "$CODEX_HOME" ] && [ "$2" != resume ]; then
     mkdir -p "$CODEX_HOME/sessions/2026/11/26"; echo '{}' > "$CODEX_HOME/sessions/2026/11/26/rollout-2026-11-26T10-00-00-t1.jsonl"
   fi
@@ -1764,7 +1778,17 @@ func TestACoordinatorSessionRunsHeadlessInAScratchDirWithOnlyCollieMCP(t *testin
 			t.Errorf("%s is not denied: %q", tool, denied)
 		}
 	}
-	for _, unwanted := range []string{"--remote-control", "bypassPermissions", "--settings", "cms_secret"} {
+	// Isolated from the person's Claude Code setup: no settings files (no hooks, plugins or permission rules of theirs),
+	// every hook off, no built-in tool.
+	for _, flag := range []string{"--setting-sources", "--tools"} {
+		if i := slices.Index(args, flag); i < 0 || i+1 >= len(args) || args[i+1] != "" {
+			t.Errorf("claude args lack %s \"\": %q", flag, args)
+		}
+	}
+	if got := argAfter(args, "--settings"); got != filepath.Join(m.Dir, "70", "settings.json") {
+		t.Errorf("--settings %q", got)
+	}
+	for _, unwanted := range []string{"--remote-control", "bypassPermissions", "cms_secret"} {
 		if strings.Contains(joined, unwanted) {
 			t.Errorf("claude args carry %q: %q", unwanted, args)
 		}
@@ -1891,5 +1915,116 @@ func TestClaudeObservesTheHeadlessResult(t *testing.T) {
 	Claude{}.Observe(`{"session_id":"s1","type":"result","usage":{"input_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":4},"modelUsage":{"m":{"outputTokens":4}}}`, &o)
 	if o.Usage == nil || *o.Usage != (machine.Usage{SessionID: "s1", Model: "m", InputTokens: 1, CacheCreationInputTokens: 2, CacheReadInputTokens: 3, OutputTokens: 4}) {
 		t.Errorf("usage = %+v", o.Usage)
+	}
+}
+
+func TestTheClaudeCoordinatorSettingsTurnEveryHookOff(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Claude{}.Command(Launch{Prompt: "p", MCPURL: "https://x/mcp", Purpose: "coordinator", TokenEnv: TokenEnv, SessionDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]any
+	if err := json.Unmarshal([]byte(read(t, argAfter(c.Args, "--settings"))), &settings); err != nil {
+		t.Fatal(err)
+	}
+	if len(settings) != 1 || settings["disableAllHooks"] != true {
+		t.Errorf("settings = %v, want only disableAllHooks: true (and none of collie-agent's own idle hooks)", settings)
+	}
+}
+
+// The person's ~/.codex/config.toml names MCP servers of their own: a coordinator session must not get them, nor a
+// shell; a build session still runs with the person's setup.
+func TestACodexCoordinatorGetsOnlyCollieMCPAndNoShell(t *testing.T) {
+	m, _, repo, out := env(t)
+	home := os.Getenv("CODEX_HOME")
+	_ = os.MkdirAll(home, 0o700)
+	config := "[mcp_servers.posthog]\nurl = \"https://mcp.posthog.test\"\n\n[mcp_servers.node_repl]\ncommand = \"node\"\n"
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	run(t, m, coordinatorSession(74, "codex"))
+	if got := read(t, filepath.Join(out, "codex", "mcp_servers")); got != "collie" {
+		t.Errorf("coordinator MCP servers = %q, want only collie", got)
+	}
+	if got := read(t, filepath.Join(out, "codex", "tools")); got != "" {
+		t.Errorf("coordinator tools = %q, want no shell", got)
+	}
+	args := strings.Join(strings.Split(read(t, filepath.Join(out, "codex", "args")), "\n"), " ")
+	for _, want := range []string{"--ignore-user-config", "--ignore-rules", "--disable shell_tool", "features.apps=false", "features.hooks=false", `web_search="disabled"`} {
+		if !strings.Contains(args, want) {
+			t.Errorf("codex coordinator args lack %q: %s", want, args)
+		}
+	}
+
+	run(t, m, session(75, "codex", repo, "auto"))
+	if got := read(t, filepath.Join(out, "codex", "mcp_servers")); got != "collie\nnode_repl\nposthog" {
+		t.Errorf("build MCP servers = %q, want the person's servers too", got)
+	}
+	if got := read(t, filepath.Join(out, "codex", "tools")); got != "shell" {
+		t.Errorf("build tools = %q, want the shell", got)
+	}
+}
+
+// Against the real claude CLI (COLLIE_AGENT_REAL_CLAUDE=1; it uses the machine's Claude login and a few tokens): a
+// coordinator launch runs no hook from the settings it finds, loads no built-in tool and still signs in.
+func TestTheRealClaudeCoordinatorRunsNoHookAndHasNoTools(t *testing.T) {
+	if os.Getenv("COLLIE_AGENT_REAL_CLAUDE") == "" {
+		t.Skip("set COLLIE_AGENT_REAL_CLAUDE=1 to run against the real claude CLI")
+	}
+	binary, err := exec.LookPath("claude")
+	if err != nil {
+		t.Skip("claude is not installed")
+	}
+	work, _ := filepath.EvalSymlinks(t.TempDir())
+	sessionDir, _ := filepath.EvalSymlinks(t.TempDir())
+	// Project settings in the working dir with hooks that leave a mark: a session that loaded them would run them.
+	_ = os.MkdirAll(filepath.Join(work, ".claude"), 0o755)
+	mark := filepath.Join(work, "hook-ran")
+	hook := []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": "touch " + shellQuote(mark)}}}}
+	if err := writeJSON(filepath.Join(work, ".claude", "settings.json"), map[string]any{"hooks": map[string]any{
+		"SessionStart": hook, "UserPromptSubmit": hook, "Stop": hook}}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Claude{}.Command(Launch{Prompt: "List every tool name you can call, comma separated, or reply NONE.", MCPURL: "http://127.0.0.1:9/mcp",
+		Purpose: "coordinator", TokenEnv: TokenEnv, SessionDir: sessionDir, Binary: binary, AgentSession: newUUID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, c.Args...)
+	cmd.Dir = work
+	cmd.Env = append(os.Environ(), c.Env...)
+	cmd.Env = append(cmd.Env, TokenEnv+"=cms_test")
+	outb, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("claude: %v\n%s", err, outb)
+	}
+	var builtins []string
+	var o Observed
+	sc := bufio.NewScanner(strings.NewReader(string(outb)))
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	for sc.Scan() {
+		Claude{}.Observe(sc.Text(), &o)
+		var e struct {
+			Type  string   `json:"type"`
+			Tools []string `json:"tools"`
+		}
+		if json.Unmarshal(sc.Bytes(), &e) == nil && e.Type == "system" {
+			for _, tool := range e.Tools {
+				if !strings.HasPrefix(tool, "mcp__") {
+					builtins = append(builtins, tool)
+				}
+			}
+		}
+	}
+	if len(builtins) > 0 {
+		t.Errorf("built-in tools loaded: %v", builtins)
+	}
+	if _, err := os.Stat(mark); err == nil {
+		t.Error("a hook from the settings in the working dir ran")
+	}
+	if o.Usage == nil || o.Usage.OutputTokens == 0 {
+		t.Errorf("no usage from the result event (not signed in?): %+v\n%s", o.Usage, outb)
 	}
 }

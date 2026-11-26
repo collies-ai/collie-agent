@@ -135,12 +135,21 @@ instead.
   - in an empty scratch dir, `<profile dir>/sessions/<id>/work` (0700), never in a repo, with no worktree or branch;
   - with collie's coordinator prompt (it calls `get_coordinator_run`, acts with collie's coordinator tools and closes
     with `finish_coordinator_run`) and the job reference in `<routine-fire-payload>`;
-  - with collie's MCP tools only, whatever permission mode the binding has. **Claude Code** runs headless
-    (`claude -p --output-format stream-json --verbose`, no Remote Control) with `--strict-mcp-config`,
-    `--allowedTools mcp__collie`, the shell, file and web tools in `--disallowedTools`, and `--permission-mode dontAsk`
-    when the CLI has it. It exits as soon as the run is done, and the usage of its final `result` event goes to collie
-    with the session's end. **Codex** runs `codex exec --json --sandbox read-only --skip-git-repo-check` with approvals
-    off;
+  - with collie's MCP tools only, whatever permission mode the binding has, and isolated from your own agent setup
+    (the session's environment holds its token, so nothing of yours runs inside it):
+    - **Claude Code** runs headless (`claude -p --output-format stream-json --verbose`, no Remote Control) with
+      `--setting-sources ""` (none of your settings files: no hooks, plugins, permission rules or env of yours),
+      `--settings` turning every hook off (`disableAllHooks`), `--tools ""` (no built-in tool: shell, files, web,
+      subagents; they are also in `--disallowedTools`), `--strict-mcp-config` with only collie's server,
+      `--allowedTools mcp__collie` and `--permission-mode dontAsk` when the CLI has it. Your claude.ai login still
+      works (it is not a setting; an `apiKeyHelper` in your settings is not used). It exits as soon as the run is
+      done, and the usage of its final `result` event goes to collie with the session's end;
+    - **Codex** runs `codex exec --json --sandbox read-only --skip-git-repo-check` with approvals off,
+      `--ignore-user-config` (none of your `config.toml`: your MCP servers, profiles and hooks; sign-in still comes from
+      `CODEX_HOME`) so collie's server is its only MCP server, `--ignore-rules`, `--disable shell_tool`, and the
+      newer exec shell, apps, plugins, hooks, browser and computer use, image tools, subagents and web search off;
+    - a CLI too old for these flags refuses to start, and the session ends with that exit code: it never runs with less
+      isolation;
   - outside the machine-wide `max_concurrency`, like reviews: builds waiting to be planned or unblocked never keep the
     coordinator from starting. Its binding allows one run at a time.
 

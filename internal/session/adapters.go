@@ -259,7 +259,11 @@ func (Claude) Command(l Launch) (Command, error) {
 		return Command{}, fmt.Errorf("writing the MCP config: %w", err)
 	}
 	settingsPath := filepath.Join(l.SessionDir, "settings.json")
-	if err := writeJSON(settingsPath, claudeSettings(l.SessionDir)); err != nil {
+	settings := claudeSettings(l.SessionDir)
+	if l.Purpose == bindings.CoordinatorPurpose {
+		settings = claudeCoordinatorSettings
+	}
+	if err := writeJSON(settingsPath, settings); err != nil {
 		return Command{}, fmt.Errorf("writing the settings: %w", err)
 	}
 	var env []string
@@ -272,7 +276,7 @@ func (Claude) Command(l Launch) (Command, error) {
 		env = append(env, "CLAUDE_CLIENT_PRESENCE_FILE="+presence)
 	}
 	if l.Purpose == bindings.CoordinatorPurpose {
-		return claudeCoordinator(l, mcpPath, env), nil
+		return claudeCoordinator(l, mcpPath, settingsPath, env), nil
 	}
 	var session []string
 	switch {
@@ -299,26 +303,40 @@ func (Claude) Command(l Launch) (Command, error) {
 }
 
 // claudeCoordinatorDenied are the built-in tools a coordinator session must never use: it has no repo, and it works
-// only through collie's MCP. Deny rules win over any allow rule in the person's own settings. --tools "" would remove
-// them too, but older claude versions do not know that flag and would refuse to start.
+// only through collie's MCP. --tools "" already removes every built-in tool; the deny rules stay as a second fence.
 var claudeCoordinatorDenied = []string{
 	"Bash", "BashOutput", "KillShell", "KillBash", "PowerShell",
 	"Read", "Edit", "MultiEdit", "Write", "NotebookEdit", "NotebookRead", "Glob", "Grep", "LS",
 	"WebFetch", "WebSearch", "Task", "Agent",
 }
 
+// claudeCoordinatorSettings turns every hook off. With the person's settings files not loaded, no hook of theirs or of
+// their plugins could run anyway; this also covers a hook from any other source. A hook would run with the session's
+// environment, session token included.
+var claudeCoordinatorSettings = map[string]any{"disableAllHooks": true}
+
 // claudeCoordinator is the command of a coordinator session: headless (`claude -p`, no terminal), so it exits when its
 // run is done instead of idling until the idle timeout, and it skips the workspace trust dialog of its scratch dir. It
-// streams JSON events, and the final result event carries the session's usage (Observe). The binding's permission mode
-// is ignored: only collie's MCP tools are allowed (the server rule mcp__collie allows all of them), the file, shell and
-// web tools are denied, and anything else that would ask for permission is refused (dontAsk, or -p's own refusal
-// where the CLI has no dontAsk).
-func claudeCoordinator(l Launch, mcpPath string, env []string) Command {
+// streams JSON events, and the final result event carries the session's usage (Observe).
+//
+// It is isolated from the person's own Claude Code setup, whatever the binding's permission mode:
+//   - --setting-sources "" loads none of their settings files (user, project, local), so none of their hooks, plugins,
+//     permission rules or environment; --settings adds disableAllHooks on top. Sign-in is not a setting: the
+//     subscription's login still works;
+//   - --tools "" removes every built-in tool (shell, files, web, subagents), and the deny list repeats them;
+//   - --strict-mcp-config with an MCP config holding only collie's server, the only tools it can call, allowed with
+//     the server rule mcp__collie; anything else that would ask is refused (dontAsk where the CLI has it, -p's own
+//     refusal otherwise).
+//
+// A claude too old for these flags refuses to start, and the session ends with that exit code: it never runs with less
+// isolation.
+func claudeCoordinator(l Launch, mcpPath, settingsPath string, env []string) Command {
 	var args []string
 	if l.AgentSession != "" {
 		args = append(args, "--session-id", l.AgentSession)
 	}
-	args = append(args, "-p", "--output-format", "stream-json", "--verbose")
+	args = append(args, "-p", "--output-format", "stream-json", "--verbose",
+		"--setting-sources", "", "--settings", settingsPath, "--tools", "")
 	if slices.Contains(claudeModes(l.Binary), "dontAsk") {
 		args = append(args, "--permission-mode", "dontAsk")
 	}
@@ -432,6 +450,30 @@ func (Codex) Binary() string { return "codex" }
 // on), full has no sandbox, plan is read-only. Anything else is auto.
 var codexSandbox = map[string]string{"auto": "workspace-write", "full": "danger-full-access", "plan": "read-only"}
 
+// codexCoordinatorIsolation keeps a coordinator session (its scratch dir is no repo: --skip-git-repo-check) away from
+// the person's own Codex setup and from anything but collie's MCP:
+//   - --ignore-user-config skips $CODEX_HOME/config.toml (their MCP servers, profiles, hooks, model settings); sign-in
+//     still comes from CODEX_HOME. collie's server is then the only MCP server (-c mcp_servers.collie);
+//   - --ignore-rules skips their execpolicy rules;
+//   - --disable shell_tool removes the shell, the way to read local files. A codex that does not know it refuses to
+//     start, so the session never runs with a shell. The other tools that reach past collie (the newer exec shell,
+//     ChatGPT apps, plugins, hooks, browser and computer use, image tools, subagents, web search) are turned off with
+//     -c: a codex too old to have one ignores the setting, and has no such tool to turn off.
+var codexCoordinatorIsolation = []string{
+	"--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
+	"--disable", "shell_tool",
+	"-c", "features.unified_exec=false",
+	"-c", "features.apps=false",
+	"-c", "features.plugins=false",
+	"-c", "features.hooks=false",
+	"-c", "features.browser_use=false",
+	"-c", "features.computer_use=false",
+	"-c", "features.view_image=false",
+	"-c", "features.image_generation=false",
+	"-c", "features.multi_agent=false",
+	"-c", `web_search="disabled"`,
+}
+
 // Command builds the codex exec command line.
 func (Codex) Command(l Launch) (Command, error) {
 	sandbox, ok := codexSandbox[l.PermissionMode]
@@ -465,7 +507,7 @@ func (Codex) Command(l Launch) (Command, error) {
 	// the sandbox as config.
 	head := []string{"exec", "--json", "--cd", l.Worktree, "--sandbox", sandbox}
 	if coordinator {
-		head = append(head, "--skip-git-repo-check") // its scratch dir is no repo
+		head = append(head, codexCoordinatorIsolation...)
 	}
 	if l.Resume {
 		head = []string{"exec", "resume", "--json", "-c", "sandbox_mode=\"" + sandbox + "\""}
