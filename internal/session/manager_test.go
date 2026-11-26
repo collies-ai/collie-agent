@@ -132,6 +132,12 @@ printf '%s' "$COLLIE_SESSION_TOKEN" > "$out/token"
 printf '%s' "$COLLIE_MCP_URL" > "$out/mcp_url"
 git rev-parse --abbrev-ref HEAD > "$out/branch" 2>/dev/null
 git log --format=%s > "$out/log" 2>/dev/null
+if [ "$name" = claude ] && [ "$1" = --session-id ] && [ "$3" = -p ]; then
+  echo '{"type":"system","subtype":"init","session_id":"'"$2"'"}'
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"planning"}]}}'
+  echo '{"duration_ms":900,"session_id":"'"$2"'","type":"result","subtype":"success","is_error":false,"usage":{"input_tokens":12,"cache_creation_input_tokens":3400,"cache_read_input_tokens":56000,"output_tokens":780},"modelUsage":{"claude-haiku-5-5":{"outputTokens":20},"claude-opus-5-5":{"outputTokens":760}}}'
+  exit ${FAKE_EXIT:-0}
+fi
 if [ "$name" = claude ]; then
   if [ ! -t 0 ] || [ ! -t 1 ]; then echo "claude: Remote Control needs a terminal" >&2; exit 9; fi
   sdir=""
@@ -626,10 +632,11 @@ func TestCanRun(t *testing.T) {
 
 func TestPromptsPerPurpose(t *testing.T) {
 	cases := map[string]string{
-		"code":       "You are collie's worker for this repo.",
-		"research":   "You are collie's worker for this repo.",
-		"qa-browser": "You are collie's QA agent",
-		"reviewer":   "You are collie's code reviewer",
+		"code":        "You are collie's worker for this repo.",
+		"research":    "You are collie's worker for this repo.",
+		"qa-browser":  "You are collie's QA agent",
+		"reviewer":    "You are collie's code reviewer",
+		"coordinator": "You are collie's coordinator for this project",
 	}
 	for purpose, start := range cases {
 		p := PromptFor(purpose, "collie review #230")
@@ -1713,5 +1720,176 @@ func TestResumedSessionsShowInTheHeartbeatAndHoldASlot(t *testing.T) {
 	}
 	if err := m2.Start(ctx, session(60, "claude", repo, "auto"), nil); err == nil || !strings.Contains(err.Error(), "at capacity") {
 		t.Errorf("a new session: %v, want at capacity", err)
+	}
+}
+
+func coordinatorSession(id int64, agent string) dispatch.Session {
+	return dispatch.Session{
+		ID:    id,
+		Agent: agent,
+		Dispatch: machine.Dispatch{Type: "dispatch", DispatchID: id, SessionID: id, RunnerID: 9, Kind: "coordinate", Purpose: "coordinator",
+			Reference: "77", Payload: json.RawMessage(`"collie coordinate #77"`), Project: "collies"},
+		// collie's binding asks for full permissions: a coordinator session ignores the mode.
+		Binding: bindings.Binding{Binding: machine.Binding{RunnerID: 9, Project: "collies", Purpose: "coordinator", PermissionMode: "full",
+			MaxConcurrency: 1, Agents: map[string]string{"coordinator": agent}}},
+		Accepted: machine.Accepted{SessionID: id, SessionToken: "cms_secret", MCPURL: "https://collie.test/p/collies/mcp", ExpiresAt: time.Now().Add(time.Hour)},
+	}
+}
+
+func TestACoordinatorSessionRunsHeadlessInAScratchDirWithOnlyCollieMCP(t *testing.T) {
+	m, api, repo, out := env(t)
+	m.Setup = map[string]string{"coordinator": "pwd -P > " + shellQuote(filepath.Join(out, "setup_pwd"))}
+	run(t, m, coordinatorSession(70, "claude"))
+
+	scratch := ScratchPath(filepath.Join(m.Dir, "70"))
+	if got := read(t, filepath.Join(out, "claude", "pwd")); got != scratch {
+		t.Errorf("ran in %s, want the scratch dir %s", got, scratch)
+	}
+	if got := read(t, filepath.Join(out, "setup_pwd")); got != scratch {
+		t.Errorf("session_setup ran in %s, want the scratch dir", got)
+	}
+	if got := read(t, filepath.Join(out, "claude", "branch")); got != "" {
+		t.Errorf("the scratch dir is a git checkout on %q", got)
+	}
+	args := strings.Split(read(t, filepath.Join(out, "claude", "args")), "\n")
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"-p --output-format stream-json --verbose", "--strict-mcp-config", "--allowedTools mcp__collie --disallowedTools"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("claude args lack %q: %q", want, args)
+		}
+	}
+	denied := strings.Split(argAfter(args, "--disallowedTools"), ",")
+	for _, tool := range []string{"Bash", "Edit", "Write", "Read", "WebFetch"} {
+		if !slices.Contains(denied, tool) {
+			t.Errorf("%s is not denied: %q", tool, denied)
+		}
+	}
+	for _, unwanted := range []string{"--remote-control", "bypassPermissions", "--settings", "cms_secret"} {
+		if strings.Contains(joined, unwanted) {
+			t.Errorf("claude args carry %q: %q", unwanted, args)
+		}
+	}
+	if !strings.Contains(joined, "-- You are collie's coordinator for this project") ||
+		!strings.HasSuffix(joined, "<routine-fire-payload> collie coordinate #77 </routine-fire-payload>") {
+		t.Errorf("the coordinator prompt with its job reference is not the last argument: %q", joined)
+	}
+
+	started, finished := api.snapshot()
+	if len(started) != 1 || started[0] != "" || len(finished) != 1 || finished[0] != 0 {
+		t.Errorf("started %q, finished %v", started, finished)
+	}
+	api.mu.Lock()
+	u := api.usage[0]
+	api.mu.Unlock()
+	if u == nil || u.InputTokens != 12 || u.CacheCreationInputTokens != 3400 || u.CacheReadInputTokens != 56000 || u.OutputTokens != 780 ||
+		u.Model != "claude-opus-5-5" || u.SessionID == "" {
+		t.Errorf("usage = %+v, want the result event's", u)
+	}
+	if _, err := os.Stat(filepath.Join(m.Dir, "70")); !os.IsNotExist(err) {
+		t.Error("the session directory was not removed")
+	}
+	if strings.Count(worktrees(t, repo), "\n") != 1 {
+		t.Errorf("the repo got a worktree:\n%s", worktrees(t, repo))
+	}
+}
+
+func TestACoordinatorAsksForNothingWhereClaudeHasDontAsk(t *testing.T) {
+	orig := claudeModes
+	t.Cleanup(func() { claudeModes = orig })
+	dir := t.TempDir()
+	l := Launch{Prompt: "p", MCPURL: "https://x/mcp", PermissionMode: "full", Purpose: "coordinator", TokenEnv: TokenEnv, SessionDir: dir, Binary: "claude"}
+	claudeModes = func(string) []string { return []string{"acceptEdits", "auto", "dontAsk", "plan"} }
+	c, err := Claude{}.Command(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := argAfter(c.Args, "--permission-mode"); got != "dontAsk" || c.TTY || c.IdleFiles {
+		t.Errorf("--permission-mode %q, tty %v, idle files %v", got, c.TTY, c.IdleFiles)
+	}
+	claudeModes = func(string) []string { return []string{"acceptEdits", "plan"} }
+	if c, _ = (Claude{}).Command(l); argAfter(c.Args, "--permission-mode") != "" {
+		t.Errorf("without dontAsk: %q", c.Args)
+	}
+}
+
+func TestACodexCoordinatorIsReadOnlyOutsideAnyRepo(t *testing.T) {
+	m, api, _, out := env(t)
+	run(t, m, coordinatorSession(71, "codex"))
+	scratch := ScratchPath(filepath.Join(m.Dir, "71"))
+	args := strings.Split(read(t, filepath.Join(out, "codex", "args")), "\n")
+	if got := argAfter(args, "--sandbox"); got != "read-only" {
+		t.Errorf("--sandbox %q, want read-only whatever the binding says", got)
+	}
+	if got := argAfter(args, "--cd"); got != scratch {
+		t.Errorf("--cd %q, want %s", got, scratch)
+	}
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"--skip-git-repo-check", `approval_policy="never"`, "You are collie's coordinator"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("codex args lack %q: %q", want, args)
+		}
+	}
+	if strings.Contains(joined, "network_access") {
+		t.Errorf("a coordinator gets the network sandbox flag: %q", args)
+	}
+	if _, finished := api.snapshot(); len(finished) != 1 || finished[0] != 0 {
+		t.Errorf("finished = %v", finished)
+	}
+}
+
+func TestCoordinatorsAreNotCappedAtMaxConcurrency(t *testing.T) {
+	m, api, repo, _ := env(t)
+	m.MaxConcurrency = 1
+	t.Setenv("FAKE_SLEEP", "30")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); m.Wait() }()
+	if err := m.Start(ctx, session(1, "claude", repo, "auto"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(ctx, coordinatorSession(2, "claude"), nil); err != nil {
+		t.Fatalf("coordinator with the machine full: %v", err)
+	}
+	if err := m.Start(ctx, session(3, "claude", repo, "auto"), nil); err == nil || !strings.Contains(err.Error(), "at capacity") {
+		t.Errorf("second build: %v, want at capacity", err)
+	}
+	waitUntil(t, "the build and the coordinator to start", func() bool { s, _ := api.snapshot(); return len(s) >= 2 })
+	waitUntil(t, "the refused build to be reported finished", func() bool { _, f := api.snapshot(); return slices.Contains(f, -1) })
+}
+
+func TestACoordinatorWhoseAgentIsMissingIsReportedFinished(t *testing.T) {
+	m, api, _, _ := env(t)
+	s := coordinatorSession(72, "gemini")
+	if err := m.Start(context.Background(), s, nil); err == nil {
+		t.Fatal("a session with no adapter started")
+	}
+	waitUntil(t, "finished -1", func() bool { _, f := api.snapshot(); return len(f) == 1 && f[0] == -1 })
+}
+
+func TestACoordinatorLeftByACrashIsNotResumed(t *testing.T) {
+	m, api, _, _ := env(t)
+	dir := filepath.Join(m.Dir, "73")
+	_ = os.MkdirAll(ScratchPath(dir), 0o700)
+	s := coordinatorSession(73, "claude")
+	_ = updateMeta(dir, func(r *worktreeMeta) {
+		r.SessionID, r.Dispatch, r.Agent, r.AgentSession = 73, &s.Dispatch, "claude", "u-1"
+	})
+	_, ad, _ := restart(t, m, api)
+	if len(ad.adopted) != 0 || len(api.resumeFailed) != 1 || !strings.Contains(api.resumeFailed[0], "coordinator sessions are not resumed") {
+		t.Errorf("adopted %v, resume_failed %q", ad.adopted, api.resumeFailed)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Error("its session dir was left")
+	}
+}
+
+func TestClaudeObservesTheHeadlessResult(t *testing.T) {
+	var o Observed
+	Claude{}.Observe(`{"type":"assistant","message":{}}`, &o)
+	if o.Usage != nil {
+		t.Fatalf("usage from a non-result event: %+v", o.Usage)
+	}
+	Claude{}.Observe(`{"session_id":"s1","type":"result","usage":{"input_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":3,"output_tokens":4},"modelUsage":{"m":{"outputTokens":4}}}`, &o)
+	if o.Usage == nil || *o.Usage != (machine.Usage{SessionID: "s1", Model: "m", InputTokens: 1, CacheCreationInputTokens: 2, CacheReadInputTokens: 3, OutputTokens: 4}) {
+		t.Errorf("usage = %+v", o.Usage)
 	}
 }

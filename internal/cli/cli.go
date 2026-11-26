@@ -468,7 +468,11 @@ func (a *App) status(p config.Profile, args []string) int {
 			if b.Purpose != "" {
 				line += " " + b.Purpose
 			}
-			line += " in " + b.Folder
+			if b.Folder != "" {
+				line += " in " + b.Folder
+			} else if b.Purpose == "coordinator" {
+				line += " (no folder: MCP only)"
+			}
 			if b.Pinned {
 				line += " (pinned)"
 			}

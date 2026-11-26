@@ -264,3 +264,31 @@ func TestASwappedExactFolderIsRefused(t *testing.T) {
 		t.Errorf("a swapped exact folder was pinned: %+v", p.Exact)
 	}
 }
+
+// A coordinator binding is project-level: collie sends it with no codebase and no folder, and it is served even with
+// no root folders. A folder (from collie or a pin) is dropped: its sessions never run in a repo.
+func TestACoordinatorBindingNeedsNoFolder(t *testing.T) {
+	server := []machine.Binding{
+		{RunnerID: 1, Project: "collies", Purpose: "coordinator", Agents: map[string]string{"coordinator": "claude"}},
+		{RunnerID: 2, Project: "collies", Purpose: "coordinator", Folder: "/etc"},
+		{RunnerID: 3, Project: "collies", Codebase: "collie", Purpose: "code"},
+	}
+	s := &config.Settings{Bindings: []config.PinnedBinding{{RunnerID: 1, Folder: "/etc"}}}
+	got := Resolve(server, s, Allowed{})
+	for _, b := range got[:2] {
+		if !b.Usable() || b.Folder != "" || b.MaxConcurrency != 1 {
+			t.Errorf("coordinator binding %d: %+v", b.RunnerID, b)
+		}
+	}
+	if got[2].Usable() {
+		t.Errorf("a code binding with no folder was accepted: %+v", got[2])
+	}
+}
+
+func TestACoordinatorPinCanStillDisableIt(t *testing.T) {
+	server := []machine.Binding{{RunnerID: 1, Project: "collies", Purpose: "coordinator"}}
+	s := &config.Settings{Bindings: []config.PinnedBinding{{RunnerID: 1, Disabled: true}}}
+	if got := Resolve(server, s, Allowed{}); got[0].Usable() {
+		t.Errorf("a disabled coordinator binding is usable: %+v", got[0])
+	}
+}

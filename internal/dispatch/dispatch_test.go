@@ -470,3 +470,73 @@ func TestASwappedExactFolderIsDeclined(t *testing.T) {
 		t.Errorf("accepted an offer into a swapped folder: %+v", api.acks[0])
 	}
 }
+
+func coordinatorBinding(runner int64) bindings.Binding {
+	return bindings.Binding{Binding: machine.Binding{RunnerID: runner, Project: "collies", Purpose: "coordinator",
+		Agents: map[string]string{"coordinator": "claude"}, MaxConcurrency: 1}}
+}
+
+func coordinate(id, runner int64) machine.Dispatch {
+	return machine.Dispatch{Type: "dispatch", DispatchID: id, SessionID: id + 1000, RunnerID: runner, Kind: "coordinate",
+		Purpose: "coordinator", Reference: "42", Payload: []byte(`"collie coordinate #42"`)}
+}
+
+// A coordinator binding has no folder and needs no root folders. Its sessions are left out of the machine-wide limit:
+// builds filling it often wait on the coordinator. Its own limit (1) still applies.
+func TestACoordinatorRunsWithoutAFolderAndIsNotCapped(t *testing.T) {
+	api := &fakeAPI{}
+	sess := &fakeSessions{}
+	d := &Dispatcher{API: api, Sessions: sess, MaxConcurrency: 1}
+	setBindings(t, d, []bindings.Binding{binding(1, "/code/collie", 2), coordinatorBinding(2)})
+	ctx := context.Background()
+
+	_ = d.Handle(ctx, offer(1, 1))      // a build fills the machine
+	_ = d.Handle(ctx, coordinate(2, 2)) // the coordinator still runs
+	_ = d.Handle(ctx, coordinate(3, 2)) // a second one at once exceeds its binding
+
+	if len(api.acks) != 3 || !api.acks[0].Accept || !api.acks[1].Accept || api.acks[2].Accept {
+		t.Fatalf("acks = %+v", api.acks)
+	}
+	if r := api.acks[2].Reason; !strings.Contains(r, "binding at capacity (1 of 1") {
+		t.Errorf("the second coordinator run was declined with %q", r)
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if len(sess.started) != 2 || sess.started[1].Agent != "claude" || sess.started[1].Binding.Folder != "" {
+		t.Errorf("started = %+v", sess.started)
+	}
+}
+
+// Without any root folder the coordinator binding is still served, while every folder binding is refused.
+func TestACoordinatorNeedsNoRootFolders(t *testing.T) {
+	api := &fakeAPI{}
+	d := &Dispatcher{API: api, Sessions: &fakeSessions{}, MaxConcurrency: 2}
+	d.SetBindings(bindings.Resolve([]machine.Binding{coordinatorBinding(2).Binding}, nil, bindings.Allowed{}), bindings.Allowed{})
+	_ = d.Handle(context.Background(), coordinate(1, 2))
+	if len(api.acks) != 1 || !api.acks[0].Accept {
+		t.Fatalf("acks = %+v", api.acks)
+	}
+}
+
+// Only a coordinator binding takes coordinator dispatches, and it takes nothing else: the other purposes need a folder.
+func TestCoordinatorDispatchesAndBindingsGoTogether(t *testing.T) {
+	api := &fakeAPI{}
+	d := &Dispatcher{API: api, Sessions: &fakeSessions{}, MaxConcurrency: 4}
+	code := binding(1, "/code/collie", 2)
+	code.Agents["coordinator"] = "claude"
+	setBindings(t, d, []bindings.Binding{code, coordinatorBinding(2)})
+	ctx := context.Background()
+
+	_ = d.Handle(ctx, coordinate(1, 1))
+	_ = d.Handle(ctx, offer(2, 2))
+
+	if len(api.acks) != 2 || api.acks[0].Accept || api.acks[1].Accept {
+		t.Fatalf("acks = %+v", api.acks)
+	}
+	if r := api.acks[0].Reason; r != `runner 1 is a code binding and does not take "coordinator" dispatches` {
+		t.Errorf("coordinator on a code binding: %q", r)
+	}
+	if r := api.acks[1].Reason; r != `runner 2 is a coordinator binding and does not take "code" dispatches` {
+		t.Errorf("code on a coordinator binding: %q", r)
+	}
+}

@@ -40,6 +40,13 @@ type Allowed struct {
 
 func (a Allowed) empty() bool { return len(a.Roots) == 0 && len(a.Exact) == 0 }
 
+// CoordinatorPurpose is the purpose of a binding that runs the project's coordinator (collie's goal #160): a
+// project-level binding with no codebase and no folder, whose sessions plan goals over collie's MCP and touch no repo.
+const CoordinatorPurpose = "coordinator"
+
+// IsCoordinator reports whether the binding runs the project's coordinator.
+func IsCoordinator(b machine.Binding) bool { return b.Purpose == CoordinatorPurpose }
+
 // Resolve applies the local settings to collie's bindings: the machine's permission mode overrides collie's, pinned
 // fields override both, and every folder is checked against the allowed folders. Pins that match no binding from
 // collie are ignored: without a runner_id from collie there is nothing to dispatch.
@@ -62,7 +69,13 @@ func Resolve(server []machine.Binding, s *config.Settings, allowed Allowed) []Bi
 				b.Refused = "disabled in the local config"
 			}
 		}
-		if b.Refused == "" {
+		switch {
+		case b.Refused != "":
+		case IsCoordinator(b.Binding):
+			// A coordinator binding is project-level: no codebase and no folder. Its sessions run in a scratch dir of
+			// their own with collie's MCP only, so there is no folder to check, and a pinned folder is ignored.
+			b.Folder = ""
+		default:
 			if folder, err := Within(b.Folder, allowed); err != nil {
 				b.Refused = err.Error()
 			} else {

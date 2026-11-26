@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/collies-ai/collie-agent/internal/bindings"
 	"github.com/collies-ai/collie-agent/internal/machine"
 )
 
@@ -24,7 +25,7 @@ type Launch struct {
 	Prompt         string
 	MCPURL         string
 	PermissionMode string // the binding's mode: auto, full or plan
-	Purpose        string // the dispatch's purpose: code, research, reviewer or qa-browser
+	Purpose        string // the dispatch's purpose: code, research, reviewer, qa-browser or coordinator
 	Binary         string // the agent CLI's resolved path
 	// TokenEnv is the environment variable that holds the session token: adapters reference it and never write the
 	// token itself to a file or a command line, where other users could read it.
@@ -270,6 +271,9 @@ func (Claude) Command(l Launch) (Command, error) {
 		}
 		env = append(env, "CLAUDE_CLIENT_PRESENCE_FILE="+presence)
 	}
+	if l.Purpose == bindings.CoordinatorPurpose {
+		return claudeCoordinator(l, mcpPath, env), nil
+	}
 	var session []string
 	switch {
 	case l.Resume:
@@ -294,6 +298,39 @@ func (Claude) Command(l Launch) (Command, error) {
 	}, nil
 }
 
+// claudeCoordinatorDenied are the built-in tools a coordinator session must never use: it has no repo, and it works
+// only through collie's MCP. Deny rules win over any allow rule in the person's own settings. --tools "" would remove
+// them too, but older claude versions do not know that flag and would refuse to start.
+var claudeCoordinatorDenied = []string{
+	"Bash", "BashOutput", "KillShell", "KillBash", "PowerShell",
+	"Read", "Edit", "MultiEdit", "Write", "NotebookEdit", "NotebookRead", "Glob", "Grep", "LS",
+	"WebFetch", "WebSearch", "Task", "Agent",
+}
+
+// claudeCoordinator is the command of a coordinator session: headless (`claude -p`, no terminal), so it exits when its
+// run is done instead of idling until the idle timeout, and it skips the workspace trust dialog of its scratch dir. It
+// streams JSON events, and the final result event carries the session's usage (Observe). The binding's permission mode
+// is ignored: only collie's MCP tools are allowed (the server rule mcp__collie allows all of them), the file, shell and
+// web tools are denied, and anything else that would ask for permission is refused (dontAsk, or -p's own refusal
+// where the CLI has no dontAsk).
+func claudeCoordinator(l Launch, mcpPath string, env []string) Command {
+	var args []string
+	if l.AgentSession != "" {
+		args = append(args, "--session-id", l.AgentSession)
+	}
+	args = append(args, "-p", "--output-format", "stream-json", "--verbose")
+	if slices.Contains(claudeModes(l.Binary), "dontAsk") {
+		args = append(args, "--permission-mode", "dontAsk")
+	}
+	args = append(args,
+		"--mcp-config", mcpPath, "--strict-mcp-config",
+		"--allowedTools", "mcp__collie",
+		"--disallowedTools", strings.Join(claudeCoordinatorDenied, ","),
+		"--", l.Prompt,
+	)
+	return Command{Binary: "claude", Env: env, Args: args}
+}
+
 // claudeSettings are hooks that touch the activity file whenever the session works (a prompt, a tool) and the idle
 // file when it stops or waits for a person. Not SessionStart: a session stuck on a dialog before its first prompt
 // has done no work, and is judged by its output.
@@ -314,11 +351,57 @@ func claudeSettings(dir string) map[string]any {
 
 var claudeURL = regexp.MustCompile(`https://claude\.ai/code/session_[A-Za-z0-9_-]+`)
 
-// Observe finds the claude.ai/code link of the Remote Control session (shown as text or as a terminal hyperlink).
+// claudeResult is the part of a headless session's final stream-json event (type result) that carries its usage.
+type claudeResult struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+	Usage     *struct {
+		InputTokens              int64 `json:"input_tokens"`
+		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+		OutputTokens             int64 `json:"output_tokens"`
+	} `json:"usage"`
+	ModelUsage map[string]json.RawMessage `json:"modelUsage"`
+}
+
+// Observe finds the claude.ai/code link of the Remote Control session (shown as text or as a terminal hyperlink) and,
+// in a headless session, the usage its final result event reports. The interactive one never prints that event: it
+// reports its usage to collie itself.
 func (Claude) Observe(line string, o *Observed) {
+	// The result event is one JSON object per line; its "type" key is not always first.
+	if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "{") && strings.Contains(trimmed, `"type":"result"`) {
+		var r claudeResult
+		if json.Unmarshal([]byte(trimmed), &r) == nil && r.Type == "result" && r.Usage != nil {
+			o.Usage = &machine.Usage{
+				SessionID:                r.SessionID,
+				Model:                    mainModel(r.ModelUsage),
+				InputTokens:              r.Usage.InputTokens,
+				CacheCreationInputTokens: r.Usage.CacheCreationInputTokens,
+				CacheReadInputTokens:     r.Usage.CacheReadInputTokens,
+				OutputTokens:             r.Usage.OutputTokens,
+			}
+		}
+		return
+	}
 	if o.URL == "" {
 		o.URL = claudeURL.FindString(line)
 	}
+}
+
+// mainModel is the model of a result event's modelUsage that wrote the most output: a session also uses a small model
+// for housekeeping, which is not the one it ran on.
+func mainModel(models map[string]json.RawMessage) string {
+	best, most := "", int64(-1)
+	for name, raw := range models {
+		var u struct {
+			OutputTokens int64 `json:"outputTokens"`
+		}
+		_ = json.Unmarshal(raw, &u)
+		if u.OutputTokens > most || (u.OutputTokens == most && name < best) {
+			best, most = name, u.OutputTokens
+		}
+	}
+	return best
 }
 
 // NewSessionID is a new uuid, passed with --session-id so the session can be resumed with --resume.
@@ -355,6 +438,11 @@ func (Codex) Command(l Launch) (Command, error) {
 	if !ok {
 		sandbox = codexSandbox["auto"]
 	}
+	coordinator := l.Purpose == bindings.CoordinatorPurpose
+	if coordinator {
+		// The coordinator only uses collie's MCP: whatever the binding says, nothing can be written and nothing asks.
+		sandbox = "read-only"
+	}
 	var network []string
 	if sandbox == "workspace-write" {
 		// workspace-write cuts the network by default, and with approval_policy never nothing can ask for it: tests that
@@ -376,6 +464,9 @@ func (Codex) Command(l Launch) (Command, error) {
 	// `codex exec resume` takes neither --cd nor --sandbox: it runs in the worktree (the process's directory) and gets
 	// the sandbox as config.
 	head := []string{"exec", "--json", "--cd", l.Worktree, "--sandbox", sandbox}
+	if coordinator {
+		head = append(head, "--skip-git-repo-check") // its scratch dir is no repo
+	}
 	if l.Resume {
 		head = []string{"exec", "resume", "--json", "-c", "sandbox_mode=\"" + sandbox + "\""}
 	}
