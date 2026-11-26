@@ -219,7 +219,7 @@ func (d *Dispatcher) reserve(key int64, m machine.Dispatch) (string, bindings.Bi
 	if err := d.Sessions.CanRun(agent); err != nil {
 		return err.Error(), b, ""
 	}
-	uncapped := uncappedPurposes[m.Purpose]
+	uncapped := Uncapped(m.Purpose)
 	busy, busyRunner := 0, 0
 	for _, slots := range []map[int64]slot{d.running, d.reserved} {
 		for _, s := range slots {
@@ -251,6 +251,10 @@ type slot struct {
 // it: only their binding's limit applies. A review is short, and the builds holding the machine's slots are often the
 // ones waiting for it; collie counts the same way (MachineDelivery::UNCAPPED_PURPOSES).
 var uncappedPurposes = map[string]bool{"reviewer": true}
+
+// Uncapped says whether sessions of this purpose are left out of the machine-wide MaxConcurrency. The session manager
+// asks it too, so the limit is counted the same way when the offer is acked and when the session starts.
+func Uncapped(purpose string) bool { return uncappedPurposes[purpose] }
 
 // agentFor picks the binding's agent for a purpose; "code" is collie's default purpose.
 // agentFor is the binding's agent for the dispatch's purpose. Research with no research agent of its own runs on the
