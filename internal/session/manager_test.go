@@ -489,6 +489,56 @@ func TestConcurrencyIsCappedAtMaxConcurrency(t *testing.T) {
 	waitUntil(t, "both agents to start", func() bool { s, _ := api.snapshot(); return len(s) >= 2 })
 }
 
+func TestReviewsAreNotCappedAtMaxConcurrency(t *testing.T) {
+	// The machine's slots full of builds (often the ones waiting for their review) must not keep a review from
+	// starting: the dispatcher acks it outside the machine-wide limit, and the manager must start it the same way.
+	m, api, repo, _ := env(t)
+	m.MaxConcurrency = 2
+	t.Setenv("FAKE_SLEEP", "30")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); m.Wait() }()
+	for _, id := range []int64{1, 2} {
+		if err := m.Start(ctx, session(id, "claude", repo, "auto"), nil); err != nil {
+			t.Fatalf("session %d: %v", id, err)
+		}
+	}
+	review := session(3, "claude", repo, "auto")
+	review.Dispatch.Kind, review.Dispatch.Purpose = "review", "reviewer"
+	review.Binding.Agents = map[string]string{"reviewer": "claude"}
+	if err := m.Start(ctx, review, nil); err != nil {
+		t.Fatalf("review with the machine full of builds: %v", err)
+	}
+	if err := m.Start(ctx, session(4, "claude", repo, "auto"), nil); err == nil || !strings.Contains(err.Error(), "at capacity") {
+		t.Errorf("third build: %v, want at capacity (the review does not free a build slot either)", err)
+	}
+	waitUntil(t, "the three agents to start", func() bool { s, _ := api.snapshot(); return len(s) >= 3 })
+}
+
+func TestASessionThatCannotStartIsReportedFinished(t *testing.T) {
+	// The dispatch was accepted before Start: collie counts the session as running until it hears it finished.
+	m, api, repo, _ := env(t)
+	m.MaxConcurrency = 1
+	t.Setenv("FAKE_SLEEP", "30")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); m.Wait() }()
+	if err := m.Start(ctx, session(1, "claude", repo, "auto"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(ctx, session(2, "claude", repo, "auto"), nil); err == nil {
+		t.Fatal("second session started past max_concurrency 1")
+	}
+	if err := m.Start(ctx, session(1, "claude", repo, "auto"), nil); err == nil {
+		t.Fatal("session 1 started twice")
+	}
+	waitUntil(t, "session 2 to be reported finished", func() bool { _, f := api.snapshot(); return len(f) == 1 })
+	cancel()
+	m.Wait()
+	_, finished := api.snapshot()
+	if len(finished) != 2 || finished[0] != -1 {
+		t.Errorf("finished = %v; want session 2 (-1) when it could not start, then session 1 when cancelled, and no extra finish for the duplicate Start", finished)
+	}
+}
+
 func TestTheDispatcherCapsSessionsAtMaxConcurrency(t *testing.T) {
 	// End to end with the dispatcher: offers beyond the machine's max_concurrency are declined, not started.
 	m, _, repo, _ := env(t)

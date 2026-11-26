@@ -62,7 +62,8 @@ type Manager struct {
 	// config. It is the profile's "sessions" directory.
 	Dir string
 	Log *log.Logger
-	// MaxConcurrency caps the sessions running at once (the dispatcher checks it too, before acking).
+	// MaxConcurrency caps the sessions running at once (the dispatcher checks it too, before acking). Sessions of an
+	// uncapped purpose (dispatch.Uncapped: reviews) do not count against it, as in the dispatcher and in collie.
 	MaxConcurrency int
 	// Adapters and LookPath are replaced by tests.
 	Adapters map[string]Adapter
@@ -92,7 +93,7 @@ type Manager struct {
 	ResumeURLWait time.Duration
 
 	mu         sync.Mutex
-	running    map[int64]bool
+	running    map[int64]bool // session id → whether it counts against MaxConcurrency
 	onRevoked  func(error)
 	isRevoked  bool
 	resumeNote ResumeNote
@@ -151,6 +152,19 @@ func (m *Manager) CanRun(agent string) error {
 	return err
 }
 
+var errAlreadyRunning = errors.New("already running")
+
+// cappedRunning counts the running sessions that count against MaxConcurrency. The caller holds m.mu.
+func (m *Manager) cappedRunning() int {
+	n := 0
+	for _, capped := range m.running {
+		if capped {
+			n++
+		}
+	}
+	return n
+}
+
 // Running reports whether the session is running (by its directory name), for the startup sweep.
 func (m *Manager) isRunning(name string) bool {
 	id, err := strconv.ParseInt(name, 10, 64)
@@ -159,7 +173,8 @@ func (m *Manager) isRunning(name string) bool {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.running[id]
+	_, ok := m.running[id]
+	return ok
 }
 
 // Sweep removes the worktrees that sessions which are no longer running left behind (a crash, a kill -9).
@@ -239,7 +254,7 @@ func (m *Manager) adopt(ctx context.Context, id int64, dir string, rec worktreeM
 	if m.running == nil {
 		m.running = map[int64]bool{}
 	}
-	m.running[id] = true
+	m.running[id] = !dispatch.Uncapped(rec.Dispatch.Purpose)
 	m.mu.Unlock()
 	m.noteResume(id, "resuming", "")
 	m.logf("session %d: resuming it (%s, %s)", id, rec.Agent, rec.AgentSession)
@@ -331,24 +346,41 @@ func (m *Manager) reissue(ctx context.Context, id int64) (*machine.Reissued, err
 func (m *Manager) Wait() { m.wg.Wait() }
 
 // Start starts the session in the background and returns. done is called once the session ended and was cleaned up.
+// The dispatch was already accepted, so collie counts the session as running: when it cannot start, collie is told it
+// finished (exit code -1), which frees its slot there and looks at the waiting work again, instead of waiting for a
+// heartbeat to notice it is gone.
 func (m *Manager) Start(ctx context.Context, s dispatch.Session, done func()) error {
+	err := m.start(ctx, s, done)
+	// A second Start of a running session must not end the one that runs.
+	if err != nil && !errors.Is(err, errAlreadyRunning) {
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			m.report(ctx, s.ID, "finished", func(c context.Context) error { return m.API.SessionFinished(c, s.ID, -1, nil, nil) })
+		}()
+	}
+	return err
+}
+
+func (m *Manager) start(ctx context.Context, s dispatch.Session, done func()) error {
 	a, path, err := m.adapter(s.Agent)
 	if err != nil {
 		return err
 	}
+	capped := !dispatch.Uncapped(s.Dispatch.Purpose)
 	m.mu.Lock()
 	if m.running == nil {
 		m.running = map[int64]bool{}
 	}
-	if m.MaxConcurrency > 0 && len(m.running) >= m.MaxConcurrency {
+	if _, ok := m.running[s.ID]; ok {
+		m.mu.Unlock()
+		return fmt.Errorf("session %d: %w", s.ID, errAlreadyRunning)
+	}
+	if capped && m.MaxConcurrency > 0 && m.cappedRunning() >= m.MaxConcurrency {
 		m.mu.Unlock()
 		return fmt.Errorf("at capacity (%d sessions)", m.MaxConcurrency)
 	}
-	if m.running[s.ID] {
-		m.mu.Unlock()
-		return fmt.Errorf("session %d is already running", s.ID)
-	}
-	m.running[s.ID] = true
+	m.running[s.ID] = capped
 	m.mu.Unlock()
 	m.launch(s.ID, done, func() { m.run(ctx, s, a, path, nil) })
 	return nil
