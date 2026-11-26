@@ -10,15 +10,74 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/collies-ai/collie-agent/internal/machine"
 )
 
-// worktreeMeta is written in each session's directory, so a sweep after a crash knows which repo and worktree it
-// belongs to. Branch is set only once git created it: cleanup deletes only a branch this session created. Worktree is
-// empty in the metadata of versions that kept the worktree in the session directory (<session dir>/worktree).
+// worktreeMeta is the session's record, written in its directory (0600): which repo and worktree it belongs to, so a
+// sweep after a crash can remove them, and what collie-agent needs to resume the session after a restart. Branch is
+// set only once git created it: cleanup deletes only a branch this session created. Worktree is empty in the metadata
+// of versions that kept the worktree in the session directory (<session dir>/worktree). It never holds the session
+// token: a resume gets a new one from collie (ReissueSessionToken).
 type worktreeMeta struct {
 	Repo     string `json:"repo"`
 	Worktree string `json:"worktree,omitempty"`
 	Branch   string `json:"branch,omitempty"`
+
+	SessionID int64 `json:"session_id,omitempty"`
+	// Dispatch is the offer as collie sent it: dispatch id, runner, kind, purpose, reference, project and codebase.
+	Dispatch       *machine.Dispatch `json:"dispatch,omitempty"`
+	Agent          string            `json:"agent,omitempty"`
+	PermissionMode string            `json:"permission_mode,omitempty"`
+	// AgentSession is the agent's own id for the session: the Claude Code session uuid (--session-id) or the Codex
+	// thread id (thread.started). Without it the session cannot be resumed.
+	AgentSession string `json:"agent_session,omitempty"`
+	// ReviewSchema and ReviewFile are a review session's output schema and answer, in the session dir.
+	ReviewSchema string `json:"review_schema,omitempty"`
+	ReviewFile   string `json:"review_file,omitempty"`
+	// Usage is what the agent's output reported before it was suspended (codex): a resume adds to it.
+	Usage *machine.Usage `json:"usage,omitempty"`
+	// Resumes counts the times collie-agent resumed it.
+	Resumes int `json:"resumes,omitempty"`
+}
+
+// resumable reports whether the record has all a resume needs.
+func (m worktreeMeta) resumable() bool {
+	return m.SessionID != 0 && m.Dispatch != nil && m.Agent != "" && m.AgentSession != "" && m.Repo != "" &&
+		m.Worktree != "" && m.Branch != ""
+}
+
+// readMeta reads a session's record.
+func readMeta(sessionDir string) (worktreeMeta, error) {
+	var m worktreeMeta
+	b, err := os.ReadFile(filepath.Join(sessionDir, metaFile))
+	if err != nil {
+		return m, err
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return m, fmt.Errorf("%s: %w", metaFile, err)
+	}
+	return m, nil
+}
+
+// updateMeta changes a session's record, keeping what it does not touch. The file is replaced in one step (0600), so
+// a crash leaves the old record or the new one.
+func updateMeta(sessionDir string, change func(*worktreeMeta)) error {
+	m, err := readMeta(sessionDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	change(&m)
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(sessionDir, metaFile)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 const metaFile = "session.json"
@@ -133,13 +192,8 @@ func addWorktree(ctx context.Context, repo, sessionDir, wt, branch string) error
 	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
 		return err
 	}
-	metaPath := filepath.Join(sessionDir, metaFile)
-	write := func(m worktreeMeta) error {
-		b, _ := json.Marshal(m)
-		return os.WriteFile(metaPath, b, 0o600)
-	}
-	// The repo first, so a sweep can prune a half-made worktree.
-	if err := write(worktreeMeta{Repo: repo, Worktree: wt}); err != nil {
+	// The repo first, so a sweep can prune a half-made worktree. What else the record holds is kept.
+	if err := updateMeta(sessionDir, func(m *worktreeMeta) { m.Repo, m.Worktree, m.Branch = repo, wt, "" }); err != nil {
 		return err
 	}
 	base, err := defaultBase(ctx, repo)
@@ -155,7 +209,7 @@ func addWorktree(ctx context.Context, repo, sessionDir, wt, branch string) error
 		}
 		return err
 	}
-	if err := write(worktreeMeta{Repo: repo, Worktree: wt, Branch: branch}); err != nil {
+	if err := updateMeta(sessionDir, func(m *worktreeMeta) { m.Branch = branch }); err != nil {
 		dctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_, _ = git(dctx, repo, "branch", "-D", branch)
 		cancel()
@@ -204,8 +258,9 @@ func removeWorktree(ctx context.Context, sessionDir string) (int, error) {
 	return stopped, first
 }
 
-// Sweep removes the worktrees of sessions that are not running: what a crash or a kill left behind. It returns how
-// many it removed.
+// Sweep removes the worktrees of sessions that are not running: what a crash or a kill left behind. A session whose
+// record can resume it is never removed: Manager.Resume resumes it or reports that it could not. It returns how many
+// it removed.
 func Sweep(ctx context.Context, sessionsDir string, running func(name string) bool) (int, error) {
 	entries, err := os.ReadDir(sessionsDir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -218,6 +273,9 @@ func Sweep(ctx context.Context, sessionsDir string, running func(name string) bo
 	var first error
 	for _, e := range entries {
 		if !e.IsDir() || (running != nil && running(e.Name())) {
+			continue
+		}
+		if m, err := readMeta(filepath.Join(sessionsDir, e.Name())); err == nil && m.resumable() {
 			continue
 		}
 		if _, err := removeWorktree(ctx, filepath.Join(sessionsDir, e.Name())); err != nil && first == nil {

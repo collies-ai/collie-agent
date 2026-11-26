@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/collies-ai/collie-agent/internal/agent"
 	"github.com/collies-ai/collie-agent/internal/config"
 	"github.com/collies-ai/collie-agent/internal/pairing"
 )
@@ -547,5 +548,31 @@ func TestPairDiscoverFlagAndForceKeepsTheAnswer(t *testing.T) {
 
 	if code := h.run("pair", "--server", srv.URL, "--force", "--discover", "gitlab"); code != exitUsage {
 		t.Errorf("--discover gitlab = %d", code)
+	}
+}
+
+func TestStatusShowsTheRestoredSessions(t *testing.T) {
+	h := newHarness(t, "linux")
+	p, err := config.Resolve("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.EnsureDir(); err != nil {
+		t.Fatal(err)
+	}
+	_ = p.SaveState(&config.State{Connection: "cable", Running: []string{"42"}, Resumed: []config.ResumedSession{
+		{SessionID: 42, Status: "resumed"},
+		{SessionID: 43, Status: "failed", Reason: "could not resume: its worktree is gone"},
+	}})
+	unlock, err := agent.Lock(p) // a run holds the profile
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	h.run("status")
+	for _, want := range []string{"Restored:    session #42 resumed", "Restored:    session #43 failed: could not resume: its worktree is gone"} {
+		if !strings.Contains(h.out.String(), want) {
+			t.Errorf("status lacks %q:\n%s", want, h.out)
+		}
 	}
 }

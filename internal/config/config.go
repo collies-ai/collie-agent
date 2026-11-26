@@ -202,6 +202,16 @@ type State struct {
 	Repos int `json:"repos,omitempty"`
 	// Running are the sessions running now.
 	Running []string `json:"running,omitempty"`
+	// Resumed are the sessions the last run left that this one resumed, or could not.
+	Resumed []ResumedSession `json:"resumed,omitempty"`
+}
+
+// ResumedSession is a session found at startup: Status is resuming, resumed or failed (with the Reason).
+type ResumedSession struct {
+	SessionID int64     `json:"session_id"`
+	Status    string    `json:"status"`
+	Reason    string    `json:"reason,omitempty"`
+	At        time.Time `json:"at"`
 }
 
 // BindingState is one binding in the state file.

@@ -35,6 +35,43 @@ type fakeAPI struct {
 	finishErr []error       // returned by successive finished calls, then nil
 	usage     []*machine.Usage
 	reviews   []json.RawMessage
+	// resuming
+	reissued     []int64
+	reissueErr   error
+	suspended    []int64
+	resumed      []string // session_url of each resumed event
+	resumeFailed []string // reason of each resume_failed event
+}
+
+func (f *fakeAPI) ReissueSessionToken(_ context.Context, id int64) (*machine.Reissued, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reissued = append(f.reissued, id)
+	if f.reissueErr != nil {
+		return nil, f.reissueErr
+	}
+	return &machine.Reissued{SessionID: id, Token: "cms_new", ExpiresAt: time.Now().Add(time.Hour), MCPURL: "https://collie.test/p/collies/mcp2"}, nil
+}
+
+func (f *fakeAPI) SessionSuspended(_ context.Context, id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.suspended = append(f.suspended, id)
+	return nil
+}
+
+func (f *fakeAPI) SessionResumed(_ context.Context, _ int64, url string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resumed = append(f.resumed, url)
+	return nil
+}
+
+func (f *fakeAPI) SessionResumeFailed(_ context.Context, _ int64, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resumeFailed = append(f.resumeFailed, reason)
+	return nil
 }
 
 func (f *fakeAPI) RenewSessionToken(context.Context, int64) (time.Time, error) {
@@ -101,6 +138,9 @@ if [ "$name" = claude ]; then
   prev=""
   for a in "$@"; do
     if [ "$prev" = "--settings" ]; then sdir=$(dirname "$a"); fi
+    if [ "$prev" = "--session-id" ] && [ -n "$CLAUDE_CONFIG_DIR" ]; then
+      mkdir -p "$CLAUDE_CONFIG_DIR/projects/p"; echo '{}' > "$CLAUDE_CONFIG_DIR/projects/p/$a.jsonl"
+    fi
     prev="$a"
   done
   if [ "$FAKE_TRUST" = old ]; then
@@ -142,6 +182,9 @@ else
     prev="$a"
   done
   if [ -n "$FAKE_REVIEW" ] && [ -n "$outfile" ]; then printf '%s' "$FAKE_REVIEW" > "$outfile"; fi
+  if [ -n "$CODEX_HOME" ] && [ "$2" != resume ]; then
+    mkdir -p "$CODEX_HOME/sessions/2026/11/26"; echo '{}' > "$CODEX_HOME/sessions/2026/11/26/rollout-2026-11-26T10-00-00-t1.jsonl"
+  fi
   echo '{"type":"thread.started","thread_id":"t1"}'
   echo '{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":200,"output_tokens":300}}'
   echo 'not json'
@@ -185,6 +228,8 @@ func env(t *testing.T) (*Manager, *fakeAPI, string, string) {
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("FAKE_OUT", out)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(base, "claude-config"))
+	t.Setenv("CODEX_HOME", filepath.Join(base, "codex-home"))
 	t.Setenv("GIT_AUTHOR_NAME", "t")
 	t.Setenv("GIT_AUTHOR_EMAIL", "t@example.com")
 	t.Setenv("GIT_COMMITTER_NAME", "t")
@@ -387,7 +432,10 @@ func TestAWorktreeFailureStillReportsFinished(t *testing.T) {
 }
 
 func TestStoppingStopsTheAgentAndCleansUp(t *testing.T) {
+	// A session that cannot be resumed (the agent kept no transcript) ends on a stop. One that can is suspended
+	// (TestAGracefulShutdownSuspendsTheSession).
 	m, api, repo, _ := env(t)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("FAKE_SLEEP", "30")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -1367,5 +1415,303 @@ func TestClaudeSessionsDoNotPushToThePhoneUnlessAllowed(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(other, PresenceFile)); !os.IsNotExist(err) {
 		t.Errorf("phone_notifications on wrote a presence file: %v", err)
+	}
+}
+
+// adopter records the sessions Resume adopts.
+type adopter struct {
+	mu      sync.Mutex
+	adopted []int64
+	freed   []int64
+}
+
+func (a *adopter) Adopt(id, _ int64, _ string) (func(), error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.adopted = append(a.adopted, id)
+	return func() { a.mu.Lock(); a.freed = append(a.freed, id); a.mu.Unlock() }, nil
+}
+
+// suspend starts a session whose agent keeps working and shuts collie-agent down gracefully once ready says so.
+func suspend(t *testing.T, m *Manager, s dispatch.Session, ready func() bool) {
+	t.Helper()
+	t.Setenv("FAKE_SLEEP", "30")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	if err := m.Start(ctx, s, func() { close(done) }); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "the agent to be ready", ready)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the agent was not stopped")
+	}
+	t.Setenv("FAKE_SLEEP", "")
+}
+
+// restart is a new collie-agent run on the same sessions directory: it resumes what the last one left and waits for it.
+func restart(t *testing.T, old *Manager, api *fakeAPI) (*Manager, *adopter, map[int64][]string) {
+	t.Helper()
+	m := &Manager{API: api, Dir: old.Dir, MaxConcurrency: 2, KillGrace: 200 * time.Millisecond, RetryWait: time.Millisecond,
+		AnswerSettle: 10 * time.Millisecond, AnswerKeyGap: 10 * time.Millisecond, ResumeURLWait: 5 * time.Second}
+	ad := &adopter{}
+	var mu sync.Mutex
+	notes := map[int64][]string{}
+	m.Resume(context.Background(), ad, func(id int64, status, reason string) {
+		mu.Lock()
+		notes[id] = append(notes[id], strings.TrimSpace(status+" "+reason))
+		mu.Unlock()
+	})
+	done := make(chan struct{})
+	go func() { m.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the resumed sessions did not finish")
+	}
+	return m, ad, notes
+}
+
+// noTokenOnDisk fails when a session token shows in any file of the sessions directory.
+func noTokenOnDisk(t *testing.T, dir string) {
+	t.Helper()
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		b, _ := os.ReadFile(path)
+		for _, tok := range []string{"cms_secret", "cms_new"} {
+			if strings.Contains(string(b), tok) {
+				t.Errorf("%s holds the session token %s", path, tok)
+			}
+		}
+		return nil
+	})
+}
+
+func TestAGracefulShutdownSuspendsTheSession(t *testing.T) {
+	m, api, repo, out := env(t)
+	suspend(t, m, session(51, "claude", repo, "auto"), func() bool { s, _ := api.snapshot(); return len(s) >= 2 })
+
+	_, finished := api.snapshot()
+	if len(finished) != 0 || !slices.Equal(api.suspended, []int64{51}) {
+		t.Fatalf("finished %v, suspended %v; want only suspended", finished, api.suspended)
+	}
+	rec, err := readMeta(filepath.Join(m.Dir, "51"))
+	if err != nil || !rec.resumable() {
+		t.Fatalf("record %+v (%v) cannot resume the session", rec, err)
+	}
+	if rec.Dispatch.DispatchID != 51 || rec.Dispatch.Purpose != "code" || rec.Agent != "claude" || rec.PermissionMode != "auto" ||
+		rec.Dispatch.Codebase != "collie" || rec.Dispatch.Project != "collies" {
+		t.Errorf("record = %+v", rec)
+	}
+	args := strings.Split(read(t, filepath.Join(out, "claude", "args")), "\n")
+	if argAfter(args, "--session-id") != rec.AgentSession || len(rec.AgentSession) != 36 {
+		t.Errorf("claude got --session-id %q, the record has %q", argAfter(args, "--session-id"), rec.AgentSession)
+	}
+	if !strings.Contains(worktrees(t, repo), WorktreePath(repo, 51)) {
+		t.Error("the suspended session's worktree was removed")
+	}
+	if b, _ := exec.Command("git", "-C", repo, "branch", "--list", "collie/session-51").Output(); len(strings.TrimSpace(string(b))) == 0 {
+		t.Error("the suspended session's branch was deleted")
+	}
+	fi, err := os.Stat(filepath.Join(m.Dir, "51", metaFile))
+	if err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("record: %v, mode %v; want 0600", err, fi.Mode().Perm())
+	}
+	noTokenOnDisk(t, m.Dir)
+
+	// A sweep never removes it.
+	m.Sweep(context.Background())
+	if _, err := os.Stat(filepath.Join(m.Dir, "51")); err != nil {
+		t.Error("the sweep removed a session that can resume")
+	}
+}
+
+func TestARestartResumesAClaudeSession(t *testing.T) {
+	m, api, repo, out := env(t)
+	suspend(t, m, session(52, "claude", repo, "full"), func() bool { s, _ := api.snapshot(); return len(s) >= 2 })
+	uuid := func() string { r, _ := readMeta(filepath.Join(m.Dir, "52")); return r.AgentSession }()
+
+	m2, ad, notes := restart(t, m, api)
+	if !slices.Equal(api.reissued, []int64{52}) || !slices.Equal(ad.adopted, []int64{52}) || !slices.Equal(ad.freed, []int64{52}) {
+		t.Errorf("reissued %v, adopted %v, freed %v", api.reissued, ad.adopted, ad.freed)
+	}
+	args := strings.Split(read(t, filepath.Join(out, "claude", "args")), "\n")
+	if argAfter(args, "--resume") != uuid || slices.Contains(args, "--session-id") || slices.Contains(args, "--fork-session") {
+		t.Errorf("claude args = %q; want --resume %s", args, uuid)
+	}
+	if argAfter(args, "--permission-mode") != "bypassPermissions" || argAfter(args, "--remote-control") != "collie collies #52" {
+		t.Errorf("the resume lost the session's flags: %q", args)
+	}
+	if !strings.HasSuffix(strings.Join(args, "\n"), "--settings\n"+filepath.Join(m.Dir, "52", "settings.json")+"\n"+strings.TrimRight(resumePrompt, "\n")) {
+		t.Errorf("args = %q, want the resume prompt last", args)
+	}
+	if got := read(t, filepath.Join(out, "claude", "token")); got != "cms_new" {
+		t.Errorf("token = %q, want the reissued one", got)
+	}
+	if got := read(t, filepath.Join(out, "claude", "mcp_url")); got != "https://collie.test/p/collies/mcp2" {
+		t.Errorf("mcp url = %q", got)
+	}
+	if got := read(t, filepath.Join(out, "claude", "pwd")); got != WorktreePath(repo, 52) {
+		t.Errorf("resumed in %s", got)
+	}
+	if !slices.Equal(api.resumed, []string{"https://claude.ai/code/session_01TESTabc-_9"}) {
+		t.Errorf("resumed events = %q, want one with the link", api.resumed)
+	}
+	if _, finished := api.snapshot(); !slices.Equal(finished, []int{0}) {
+		t.Errorf("finished = %v, want the resumed agent's exit 0", finished)
+	}
+	if got := notes[52]; !slices.Equal(got, []string{"resuming", "resumed"}) {
+		t.Errorf("notes = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(m2.Dir, "52")); !os.IsNotExist(err) {
+		t.Error("the finished session was not cleaned up")
+	}
+}
+
+func TestARestartResumesACodexSession(t *testing.T) {
+	m, api, repo, out := env(t)
+	s := session(53, "codex", repo, "auto")
+	suspend(t, m, s, func() bool {
+		b, _ := os.ReadFile(filepath.Join(m.Dir, "53", "agent.log"))
+		return strings.Contains(string(b), `"output_tokens":50`)
+	})
+	if rec, _ := readMeta(filepath.Join(m.Dir, "53")); rec.AgentSession != "t1" || !slices.Equal(api.suspended, []int64{53}) {
+		t.Fatalf("record thread %q, suspended %v", rec.AgentSession, api.suspended)
+	}
+
+	restart(t, m, api)
+	args := strings.Split(read(t, filepath.Join(out, "codex", "args")), "\n")
+	if len(args) < 4 || args[0] != "exec" || args[1] != "resume" || args[2] != "--json" ||
+		!strings.HasSuffix(strings.Join(args, "\n"), "\nt1\n"+strings.TrimRight(resumePrompt, "\n")) {
+		t.Errorf("codex args = %q; want exec resume --json ... t1 <resume prompt>", args)
+	}
+	if !slices.Contains(args, `sandbox_mode="workspace-write"`) || !slices.Contains(args, "sandbox_workspace_write.network_access=true") ||
+		!slices.Contains(args, `mcp_servers.collie.bearer_token_env_var="COLLIE_SESSION_TOKEN"`) || slices.Contains(args, "--cd") {
+		t.Errorf("codex args = %q; want the same overrides as the first run", args)
+	}
+	if !slices.Equal(api.resumed, []string{""}) {
+		t.Errorf("resumed = %q", api.resumed)
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if len(api.usage) != 1 || api.usage[0] == nil || api.usage[0].OutputTokens != 700 || api.usage[0].InputTokens != 3400 {
+		t.Errorf("usage = %+v; want both runs added up", api.usage)
+	}
+}
+
+func TestACodexReviewResumesWithItsOutputSchema(t *testing.T) {
+	m, api, repo, out := env(t)
+	suspend(t, m, reviewSession(54, "codex", repo), func() bool {
+		r, _ := readMeta(filepath.Join(m.Dir, "54"))
+		return r.AgentSession == "t1"
+	})
+	restart(t, m, api)
+	args := strings.Split(read(t, filepath.Join(out, "codex", "args")), "\n")
+	dir := filepath.Join(m.Dir, "54")
+	if argAfter(args, "--output-schema") != filepath.Join(dir, "review.schema.json") || argAfter(args, "-o") != filepath.Join(dir, ReviewFile) {
+		t.Errorf("codex args = %q", args)
+	}
+}
+
+func TestAResumeCollieNoLongerHoldsIsCleanedUpWithoutAnEvent(t *testing.T) {
+	m, api, repo, _ := env(t)
+	suspend(t, m, session(55, "claude", repo, "auto"), func() bool { s, _ := api.snapshot(); return len(s) >= 2 })
+	api.reissueErr = fmt.Errorf("%w: gone", machine.ErrGone)
+
+	_, ad, notes := restart(t, m, api)
+	if len(api.resumeFailed) != 0 || len(api.resumed) != 0 {
+		t.Errorf("resume_failed %q, resumed %q; collie said the session is gone", api.resumeFailed, api.resumed)
+	}
+	if !slices.Equal(ad.freed, []int64{55}) {
+		t.Errorf("freed %v", ad.freed)
+	}
+	if got := notes[55]; len(got) != 2 || !strings.HasPrefix(got[1], "failed collie no longer holds") {
+		t.Errorf("notes = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(m.Dir, "55")); !os.IsNotExist(err) {
+		t.Error("the session directory is still there")
+	}
+	if strings.Contains(worktrees(t, repo), WorktreePath(repo, 55)) {
+		t.Error("the worktree is still there")
+	}
+}
+
+func TestAResumeWithoutItsWorktreeFails(t *testing.T) {
+	m, api, repo, _ := env(t)
+	suspend(t, m, session(56, "claude", repo, "auto"), func() bool { s, _ := api.snapshot(); return len(s) >= 2 })
+	gitRun(t, repo, "worktree", "remove", "--force", WorktreePath(repo, 56))
+
+	_, _, notes := restart(t, m, api)
+	if len(api.resumeFailed) != 1 || !strings.Contains(api.resumeFailed[0], "worktree") {
+		t.Errorf("resume_failed = %q, want the missing worktree", api.resumeFailed)
+	}
+	if _, finished := api.snapshot(); len(finished) != 0 || len(api.resumed) != 0 {
+		t.Errorf("finished %v, resumed %v", finished, api.resumed)
+	}
+	if got := notes[56]; len(got) != 2 || !strings.Contains(got[1], "worktree") {
+		t.Errorf("notes = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(m.Dir, "56")); !os.IsNotExist(err) {
+		t.Error("the session directory is still there")
+	}
+	if b, _ := exec.Command("git", "-C", repo, "branch", "--list", "collie/session-56").Output(); len(strings.TrimSpace(string(b))) > 0 {
+		t.Error("the branch is still there")
+	}
+}
+
+func TestAResumeWithoutTheTranscriptFails(t *testing.T) {
+	m, api, repo, _ := env(t)
+	suspend(t, m, session(57, "claude", repo, "auto"), func() bool { s, _ := api.snapshot(); return len(s) >= 2 })
+	_ = os.RemoveAll(os.Getenv("CLAUDE_CONFIG_DIR"))
+	restart(t, m, api)
+	if len(api.resumeFailed) != 1 || !strings.Contains(api.resumeFailed[0], "transcript") {
+		t.Errorf("resume_failed = %q", api.resumeFailed)
+	}
+}
+
+func TestRecordsThatCannotResumeAreReported(t *testing.T) {
+	m, api, _, _ := env(t)
+	for name, content := range map[string]string{"60": "{not json", "61": `{"repo":"/nowhere"}`} {
+		_ = os.MkdirAll(filepath.Join(m.Dir, name), 0o700)
+		_ = os.WriteFile(filepath.Join(m.Dir, name, metaFile), []byte(content), 0o600)
+	}
+	_ = os.MkdirAll(filepath.Join(m.Dir, "62"), 0o700)    // nothing recorded
+	_ = os.MkdirAll(filepath.Join(m.Dir, "stray"), 0o700) // no session id at all
+	_, ad, notes := restart(t, m, api)
+	if len(api.resumeFailed) != 3 || len(ad.adopted) != 0 {
+		t.Errorf("resume_failed %q, adopted %v; want 3 reports and nothing adopted", api.resumeFailed, ad.adopted)
+	}
+	if len(notes) != 3 || !strings.Contains(notes[60][0], "cannot be read") {
+		t.Errorf("notes = %q", notes)
+	}
+	entries, _ := os.ReadDir(m.Dir)
+	if len(entries) != 0 {
+		t.Errorf("left %d entries in the sessions dir", len(entries))
+	}
+}
+
+func TestResumedSessionsShowInTheHeartbeatAndHoldASlot(t *testing.T) {
+	m, api, repo, _ := env(t)
+	suspend(t, m, session(58, "claude", repo, "auto"), func() bool { s, _ := api.snapshot(); return len(s) >= 2 })
+	t.Setenv("FAKE_SLEEP", "30")
+	d := &dispatch.Dispatcher{API: &ackRecorder{}, MaxConcurrency: 1}
+	m2 := &Manager{API: api, Dir: m.Dir, MaxConcurrency: 1, KillGrace: 200 * time.Millisecond, RetryWait: time.Millisecond,
+		AnswerSettle: 10 * time.Millisecond, AnswerKeyGap: 10 * time.Millisecond}
+	d.Sessions = m2
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() { cancel(); m2.Wait() }()
+	m2.Resume(ctx, d, nil)
+	if got := d.Running(); !slices.Equal(got, []string{"58"}) {
+		t.Errorf("running = %v right after Resume, want the resumed session", got)
+	}
+	if _, err := d.Adopt(59, 1, "code"); err == nil || !strings.Contains(err.Error(), "capacity") {
+		t.Errorf("a second session: %v, want at capacity", err)
+	}
+	if err := m2.Start(ctx, session(60, "claude", repo, "auto"), nil); err == nil || !strings.Contains(err.Error(), "at capacity") {
+		t.Errorf("a new session: %v, want at capacity", err)
 	}
 }

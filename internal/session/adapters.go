@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -32,6 +33,11 @@ type Launch struct {
 	// PhoneNotifications lets the agent push to the person's phone; off, Claude Code is told someone is at the
 	// terminal (CLAUDE_CLIENT_PRESENCE_FILE), which keeps its pushes quiet.
 	PhoneNotifications bool
+	// AgentSession is the agent's own id for the session: the Claude Code session uuid collie-agent picks at launch
+	// (--session-id), or the Codex thread to resume. Resume relaunches that session instead of starting a new one, on
+	// Prompt (the resume prompt).
+	AgentSession string
+	Resume       bool
 }
 
 // Command is the agent process to start.
@@ -87,12 +93,19 @@ type Adapter interface {
 	Command(l Launch) (Command, error)
 	// Observe reads one line of the agent's output (raw, escape codes included) for the session link and token usage.
 	Observe(line string, o *Observed)
+	// NewSessionID is the id collie-agent gives a new session of this agent (Launch.AgentSession), or "" when the agent
+	// picks its own and Observe reports it (Observed.Thread).
+	NewSessionID() string
+	// HasTranscript says whether the agent kept the session with this id on disk, so it can be resumed.
+	HasTranscript(id string) bool
 }
 
 // Observed is what the output told about the session so far.
 type Observed struct {
 	URL   string
 	Usage *machine.Usage
+	// Thread is the agent's own session id when its output tells it (codex's thread.started).
+	Thread string
 }
 
 // Adapters are the agents collie-agent can run, by the name collie uses in bindings.
@@ -257,16 +270,23 @@ func (Claude) Command(l Launch) (Command, error) {
 		}
 		env = append(env, "CLAUDE_CLIENT_PRESENCE_FILE="+presence)
 	}
+	var session []string
+	switch {
+	case l.Resume:
+		session = []string{"--resume", l.AgentSession} // the same session, never --fork-session
+	case l.AgentSession != "":
+		session = []string{"--session-id", l.AgentSession}
+	}
 	return Command{
 		Binary: "claude",
 		Env:    env,
-		Args: []string{
+		Args: append(session,
 			"--remote-control", l.Name,
 			"--permission-mode", mode,
 			"--mcp-config", mcpPath, "--strict-mcp-config",
 			"--settings", settingsPath,
 			l.Prompt,
-		},
+		),
 		TTY:       true,
 		Answers:   []Answer{{Match: claudeTrust, Respond: claudeTrustKeys}},
 		IdleFiles: true,
@@ -299,6 +319,23 @@ func (Claude) Observe(line string, o *Observed) {
 	if o.URL == "" {
 		o.URL = claudeURL.FindString(line)
 	}
+}
+
+// NewSessionID is a new uuid, passed with --session-id so the session can be resumed with --resume.
+func (Claude) NewSessionID() string { return newUUID() }
+
+// HasTranscript looks for the session's transcript, <claude config dir>/projects/<project>/<uuid>.jsonl.
+func (Claude) HasTranscript(id string) bool {
+	if id == "" || strings.ContainsAny(id, `/\*?[`) {
+		return false
+	}
+	dir := os.Getenv("CLAUDE_CONFIG_DIR")
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".claude")
+	}
+	m, _ := filepath.Glob(filepath.Join(dir, "projects", "*", id+".jsonl"))
+	return len(m) > 0
 }
 
 // Codex runs `codex exec --json` headless with collie's MCP (streamable HTTP, bearer token from the environment). It
@@ -336,40 +373,53 @@ func (Codex) Command(l Launch) (Command, error) {
 	}
 	url, _ := json.Marshal(l.MCPURL)
 	env, _ := json.Marshal(l.TokenEnv)
-	return Command{
-		Binary: "codex",
-		Args: append(append([]string{
-			"exec", "--json",
-			"--cd", l.Worktree,
-			"--sandbox", sandbox,
-			"-c", "approval_policy=\"never\"",
-		}, append(network, review...)...), []string{
-			"-c", "mcp_servers.collie.url=" + string(url),
-			"-c", "mcp_servers.collie.bearer_token_env_var=" + string(env),
-			l.Prompt,
-		}...),
-	}, nil
+	// `codex exec resume` takes neither --cd nor --sandbox: it runs in the worktree (the process's directory) and gets
+	// the sandbox as config.
+	head := []string{"exec", "--json", "--cd", l.Worktree, "--sandbox", sandbox}
+	if l.Resume {
+		head = []string{"exec", "resume", "--json", "-c", "sandbox_mode=\"" + sandbox + "\""}
+	}
+	args := append(head, "-c", "approval_policy=\"never\"")
+	args = append(args, network...)
+	args = append(args, review...)
+	args = append(args,
+		"-c", "mcp_servers.collie.url="+string(url),
+		"-c", "mcp_servers.collie.bearer_token_env_var="+string(env),
+	)
+	if l.Resume {
+		args = append(args, l.AgentSession)
+	}
+	return Command{Binary: "codex", Args: append(args, l.Prompt)}, nil
 }
 
 // codexEvent is the part of a `codex exec --json` event that carries usage: every turn.completed has the turn's
 // tokens.
 type codexEvent struct {
-	Type  string `json:"type"`
-	Usage *struct {
+	Type     string `json:"type"`
+	ThreadID string `json:"thread_id"`
+	Usage    *struct {
 		InputTokens       int64 `json:"input_tokens"`
 		CachedInputTokens int64 `json:"cached_input_tokens"`
 		OutputTokens      int64 `json:"output_tokens"`
 	} `json:"usage"`
 }
 
-// Observe adds up the usage of every completed turn. Codex has no session link.
+// Observe adds up the usage of every completed turn and notes the thread id (thread.started), which resumes the
+// session. Codex has no session link.
 func (Codex) Observe(line string, o *Observed) {
 	line = strings.TrimSpace(line)
 	if !strings.HasPrefix(line, "{") {
 		return
 	}
 	var e codexEvent
-	if json.Unmarshal([]byte(line), &e) != nil || e.Type != "turn.completed" || e.Usage == nil {
+	if json.Unmarshal([]byte(line), &e) != nil {
+		return
+	}
+	if e.Type == "thread.started" && e.ThreadID != "" && o.Thread == "" {
+		o.Thread = e.ThreadID
+		return
+	}
+	if e.Type != "turn.completed" || e.Usage == nil {
 		return
 	}
 	if o.Usage == nil {
@@ -379,6 +429,42 @@ func (Codex) Observe(line string, o *Observed) {
 	o.Usage.InputTokens += e.Usage.InputTokens - e.Usage.CachedInputTokens
 	o.Usage.CacheReadInputTokens += e.Usage.CachedInputTokens
 	o.Usage.OutputTokens += e.Usage.OutputTokens
+}
+
+// NewSessionID is empty: codex names its thread and tells it in thread.started.
+func (Codex) NewSessionID() string { return "" }
+
+// HasTranscript looks for the thread's rollout, <codex home>/sessions/YYYY/MM/DD/rollout-<time>-<thread>.jsonl.
+func (Codex) HasTranscript(id string) bool {
+	if id == "" {
+		return false
+	}
+	dir := os.Getenv("CODEX_HOME")
+	if dir == "" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, ".codex")
+	}
+	found := false
+	_ = filepath.WalkDir(filepath.Join(dir, "sessions"), func(path string, d os.DirEntry, err error) error {
+		if err != nil || found {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() && strings.HasSuffix(d.Name(), "-"+id+".jsonl") {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
+// newUUID is a random (version 4) uuid.
+func newUUID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 func writeJSON(path string, v any) error {

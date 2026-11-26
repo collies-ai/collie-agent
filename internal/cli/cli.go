@@ -432,6 +432,16 @@ func (a *App) status(p config.Profile, args []string) int {
 	if running && st != nil && st.Connection != "" {
 		fmt.Fprintf(w, "Dispatches:  over the %s, %d running\n", st.Connection, len(st.Running))
 	}
+	if running && st != nil {
+		for _, rs := range st.Resumed {
+			switch rs.Status {
+			case "failed":
+				fmt.Fprintf(w, "Restored:    session #%d failed: %s\n", rs.SessionID, rs.Reason)
+			default:
+				fmt.Fprintf(w, "Restored:    session #%d %s\n", rs.SessionID, rs.Status)
+			}
+		}
+	}
 	if settings, err := p.LoadSettings(); err != nil {
 		fmt.Fprintf(w, "Config:      unreadable: %v\n", err)
 	} else {

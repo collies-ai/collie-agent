@@ -232,3 +232,54 @@ func sessionError(err error) error {
 	}
 	return err
 }
+
+// Reissued is a new session token for a session collie-agent resumes after a restart (the plaintext token is never
+// kept on disk).
+type Reissued struct {
+	SessionID int64     `json:"session_id"`
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expires_at"`
+	MCPURL    string    `json:"mcp_url"`
+}
+
+// ReissueSessionToken asks for a new token for a session of this machine that collie still holds as accepted
+// (suspended or not), even when the old token expired; the old token stops working. ErrGone means the session is no
+// longer this machine's to resume.
+func (c *Client) ReissueSessionToken(ctx context.Context, sessionID int64) (*Reissued, error) {
+	var out Reissued
+	err := c.do(ctx, http.MethodPost, fmt.Sprintf("/machine/v1/sessions/%d/token/reissue", sessionID), map[string]any{}, &out)
+	if err != nil {
+		return nil, sessionError(err)
+	}
+	return &out, nil
+}
+
+// SessionSuspended reports a graceful shutdown: the agent process was stopped to be resumed when collie-agent runs
+// again, and the session stays accepted.
+func (c *Client) SessionSuspended(ctx context.Context, sessionID int64) error {
+	return c.sessionEvent(ctx, sessionID, map[string]any{"event": "suspended"})
+}
+
+// SessionResumed reports that the agent process was resumed after a restart, with its new link when it has one.
+func (c *Client) SessionResumed(ctx context.Context, sessionID int64, sessionURL string) error {
+	body := map[string]any{"event": "resumed"}
+	if sessionURL != "" {
+		body["session_url"] = sessionURL
+	}
+	return c.sessionEvent(ctx, sessionID, body)
+}
+
+// ResumeReasonMax is the longest reason collie takes on a resume_failed event.
+const ResumeReasonMax = 1000
+
+// SessionResumeFailed reports that a session could not be resumed after a restart; collie finishes it with the reason.
+func (c *Client) SessionResumeFailed(ctx context.Context, sessionID int64, reason string) error {
+	if len(reason) > ResumeReasonMax {
+		reason = reason[:ResumeReasonMax]
+	}
+	return c.sessionEvent(ctx, sessionID, map[string]any{"event": "resume_failed", "reason": reason})
+}
+
+func (c *Client) sessionEvent(ctx context.Context, sessionID int64, body map[string]any) error {
+	return sessionError(c.do(ctx, http.MethodPost, fmt.Sprintf("/machine/v1/sessions/%d/events", sessionID), body, nil))
+}

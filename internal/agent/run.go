@@ -24,6 +24,7 @@ import (
 	"github.com/collies-ai/collie-agent/internal/discovery"
 	"github.com/collies-ai/collie-agent/internal/dispatch"
 	"github.com/collies-ai/collie-agent/internal/machine"
+	"github.com/collies-ai/collie-agent/internal/session"
 	"github.com/collies-ai/collie-agent/internal/version"
 )
 
@@ -223,6 +224,19 @@ func (r *Runner) updateState(f func(st *config.State)) {
 	}
 }
 
+// noteResume records in the state what happened to a session resumed at startup, for `status`.
+func (r *Runner) noteResume(id int64, status, reason string) {
+	r.updateState(func(st *config.State) {
+		for i := range st.Resumed {
+			if st.Resumed[i].SessionID == id {
+				st.Resumed[i].Status, st.Resumed[i].Reason, st.Resumed[i].At = status, reason, r.now()
+				return
+			}
+		}
+		st.Resumed = append(st.Resumed, config.ResumedSession{SessionID: id, Status: status, Reason: reason, At: r.now()})
+	})
+}
+
 func (r *Runner) noteError(err error) {
 	r.updateState(func(st *config.State) {
 		st.LastError = err.Error()
@@ -242,6 +256,7 @@ func (r *Runner) Loop(ctx context.Context) error {
 	st.Revoked = false
 	st.Connection = ""
 	st.Running = nil
+	st.Resumed = nil
 	r.state = st
 	r.updateState(func(*config.State) {})
 
@@ -252,11 +267,7 @@ func (r *Runner) Loop(ctx context.Context) error {
 	r.rescan = make(chan struct{}, 1)
 	r.dispatcher = &dispatch.Dispatcher{API: r.Remote, Sessions: sessions, Log: r.logger(), MaxConcurrency: r.maxConcurrency()}
 
-	// Sessions that keep files on disk sweep what a crash left behind before taking new work, and the runner waits
-	// for running sessions to be stopped and cleaned up before it returns.
-	if sw, ok := sessions.(interface{ Sweep(context.Context) }); ok {
-		sw.Sweep(ctx)
-	}
+	// The runner waits for running sessions to be stopped (suspended) and cleaned up before it returns.
 	if w, ok := sessions.(interface{ Wait() }); ok {
 		defer w.Wait()
 	}
@@ -274,6 +285,15 @@ func (r *Runner) Loop(ctx context.Context) error {
 	// A 401 on a session endpoint (renewing a token, reporting an event) is a revocation like any other: stop it all.
 	if rv, ok := sessions.(interface{ OnRevoked(func(error)) }); ok {
 		rv.OnRevoked(r.stop)
+	}
+	// Before taking new work, sessions that keep files on disk resume what the last run left (they are in the first
+	// heartbeat's running sessions) or, without resume, sweep it.
+	if rs, ok := sessions.(interface {
+		Resume(context.Context, session.Adopter, session.ResumeNote)
+	}); ok {
+		rs.Resume(ctx, r.dispatcher, r.noteResume)
+	} else if sw, ok := sessions.(interface{ Sweep(context.Context) }); ok {
+		sw.Sweep(ctx)
 	}
 	var wg sync.WaitGroup
 	start := func(f func(context.Context) error) {
