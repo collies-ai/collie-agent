@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1285,5 +1286,36 @@ func TestOnlyReviewSessionsGetTheReviewFile(t *testing.T) {
 	run(t, m, session(95, "claude", repo, "auto"))
 	if got := read(t, filepath.Join(out, "claude", "review_env")); got != "" {
 		t.Errorf("a code session got the review env %q", got)
+	}
+}
+
+func TestClaudeSessionsDoNotPushToThePhoneUnlessAllowed(t *testing.T) {
+	dir := t.TempDir()
+	l := Launch{Name: "n", Worktree: dir, Prompt: "p", MCPURL: "https://collie.test/p/x/mcp", TokenEnv: TokenEnv, SessionDir: dir}
+	cmd, err := Claude{}.Command(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	presence := filepath.Join(dir, PresenceFile)
+	if !slices.Contains(cmd.Env, "CLAUDE_CLIENT_PRESENCE_FILE="+presence) {
+		t.Errorf("env %q has no presence file", cmd.Env)
+	}
+	if _, err := os.Stat(presence); err != nil {
+		t.Errorf("the presence file must exist while the session runs: %v", err)
+	}
+
+	other := t.TempDir()
+	l.SessionDir, l.PhoneNotifications = other, true
+	cmd, err = Claude{}.Command(l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range cmd.Env {
+		if strings.HasPrefix(e, "CLAUDE_CLIENT_PRESENCE_FILE=") {
+			t.Errorf("phone_notifications on: %q", e)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(other, PresenceFile)); !os.IsNotExist(err) {
+		t.Errorf("phone_notifications on wrote a presence file: %v", err)
 	}
 }

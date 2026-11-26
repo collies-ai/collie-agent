@@ -197,6 +197,9 @@ knows nothing about what the command does.
 { "session_setup": { "reviewer": "~/bin/use-review-identity" } }
 ```
 
+Claude Code sessions don't push to your phone: collie-agent points `CLAUDE_CLIENT_PRESENCE_FILE` at a file in the
+session's folder, so Claude Code acts as if you were at the terminal. Set `"phone_notifications": true` to get them.
+
 `permission_mode` (`auto`, `full` or `plan`) is the mode of every binding on this machine: when it is set, the mode
 chosen in collie is ignored. A pin matches a binding from collie by `runner_id`, or by `project` + `codebase`
 (+ `purpose`), and replaces the fields it sets, its `permission_mode` included (it wins over the machine's);
