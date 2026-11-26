@@ -29,6 +29,9 @@ type Launch struct {
 	// token itself to a file or a command line, where other users could read it.
 	TokenEnv   string
 	SessionDir string // private to this session (0700), outside the worktree
+	// PhoneNotifications lets the agent push to the person's phone; off, Claude Code is told someone is at the
+	// terminal (CLAUDE_CLIENT_PRESENCE_FILE), which keeps its pushes quiet.
+	PhoneNotifications bool
 }
 
 // Command is the agent process to start.
@@ -73,6 +76,9 @@ const (
 	ActivityFile = "activity"
 	IdleFile     = "idle"
 )
+
+// PresenceFile, in the session dir, tells Claude Code someone is at the terminal so it does not push to the phone.
+const PresenceFile = "presence"
 
 // Adapter knows how to run one agent CLI on a collie job.
 type Adapter interface {
@@ -242,8 +248,18 @@ func (Claude) Command(l Launch) (Command, error) {
 	if err := writeJSON(settingsPath, claudeSettings(l.SessionDir)); err != nil {
 		return Command{}, fmt.Errorf("writing the settings: %w", err)
 	}
+	var env []string
+	if !l.PhoneNotifications {
+		// Claude Code skips its phone pushes while this file exists, as if the person were at the terminal.
+		presence := filepath.Join(l.SessionDir, PresenceFile)
+		if err := os.WriteFile(presence, nil, 0o600); err != nil {
+			return Command{}, fmt.Errorf("writing the presence file: %w", err)
+		}
+		env = append(env, "CLAUDE_CLIENT_PRESENCE_FILE="+presence)
+	}
 	return Command{
 		Binary: "claude",
+		Env:    env,
 		Args: []string{
 			"--remote-control", l.Name,
 			"--permission-mode", mode,

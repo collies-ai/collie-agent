@@ -64,6 +64,8 @@ type Manager struct {
 	IdlePoll    time.Duration
 	// Setup is the local config's session_setup: a command per purpose run in the worktree before the agent starts.
 	Setup map[string]string
+	// PhoneNotifications lets Claude Code sessions push to the person's phone (settings phone_notifications).
+	PhoneNotifications bool
 	// AnswerSettle is how long the answer to a startup dialog waits once the dialog showed (default 500ms), and
 	// AnswerKeyGap the pause between its keys (default 150ms).
 	AnswerSettle time.Duration
@@ -249,6 +251,7 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 	spec, err := a.Command(Launch{
 		Name: name, Worktree: worktree, Prompt: PromptFor(s.Dispatch.Purpose, payload), MCPURL: mcpURL(s),
 		PermissionMode: s.Binding.PermissionMode, Purpose: s.Dispatch.Purpose, Binary: binary, TokenEnv: TokenEnv, SessionDir: dir,
+		PhoneNotifications: m.PhoneNotifications,
 	})
 	if err != nil {
 		return -1, nil, err

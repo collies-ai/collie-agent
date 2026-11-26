@@ -30,6 +30,9 @@ type Settings struct {
 	// research, reviewer, qa-browser): e.g. give the reviewer its own git and GitHub identity. A command that fails
 	// stops the session before the agent runs.
 	SessionSetup map[string]string `json:"session_setup,omitempty"`
+	// PhoneNotifications lets Claude Code sessions push to the person's phone (Remote Control). Off by default: every
+	// session collie starts would otherwise notify, and the person follows them in collie.
+	PhoneNotifications bool `json:"phone_notifications,omitempty"`
 	// Bindings pins or overrides collie's bindings, matched by runner_id or by project + codebase (+ purpose).
 	Bindings []PinnedBinding `json:"bindings,omitempty"`
 }
