@@ -1,0 +1,3 @@
+continue
+
+collie-agent restarted and resumed this session where it stopped. Before you go on, check with collie that the work is still yours: call claim_task again for the task you held (or get_goal for the goal you were working). If collie says the task is no longer yours (another session holds it, it was released, finished or cancelled, or the goal was closed), stop: do not push or report anything for it, and end your turn. Otherwise continue where you left off.

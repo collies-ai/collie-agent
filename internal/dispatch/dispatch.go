@@ -105,6 +105,35 @@ func (d *Dispatcher) Running() []string {
 	return out
 }
 
+// Adopt takes in a session resumed after a restart: it holds a slot like a session this run accepted and shows in the
+// heartbeat's running sessions, so collie keeps it. A session beyond the machine-wide limit is refused (the binding's
+// own limit is not known before the bindings sync). done frees the slot.
+func (d *Dispatcher) Adopt(sessionID, runnerID int64, purpose string) (func(), error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.handled == nil {
+		d.handled, d.running, d.reserved = map[int64]bool{}, map[int64]slot{}, map[int64]slot{}
+	}
+	if _, ok := d.running[sessionID]; ok {
+		return nil, fmt.Errorf("session %d is already running", sessionID)
+	}
+	uncapped := uncappedPurposes[purpose]
+	busy := 0
+	for _, slots := range []map[int64]slot{d.running, d.reserved} {
+		for _, s := range slots {
+			if !s.uncapped {
+				busy++
+			}
+		}
+	}
+	if max := d.MaxConcurrency; max > 0 && !uncapped && busy >= max {
+		return nil, fmt.Errorf("machine at capacity (%d of %d sessions)", busy, max)
+	}
+	d.handled[sessionID] = true
+	d.running[sessionID] = slot{runner: runnerID, uncapped: uncapped}
+	return func() { d.finish(sessionID) }, nil
+}
+
 func (d *Dispatcher) logf(format string, args ...any) {
 	if d.Log != nil {
 		d.Log.Printf(format, args...)

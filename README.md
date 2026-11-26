@@ -56,7 +56,7 @@ without retrying. To pair again, run `collie-agent pair --force`.
 | `service uninstall` | Stops and removes it. |
 | `service status` | What launchd or systemd says about it (exit 0 when running). |
 | `roots add\|remove <folder>`, `roots list` | Manages the root folders (restart the service after a change). |
-| `status` | Pairing, last heartbeat, how dispatches arrive, roots, discovery, repos, bindings, last error and the service. |
+| `status` | Pairing, last heartbeat, how dispatches arrive, the sessions restored at startup, roots, discovery, repos, bindings, last error and the service. |
 | `run` | Runs in the foreground: what the service runs. |
 | `version` | Prints the version. |
 
@@ -163,9 +163,23 @@ instead.
     in collie's review shape (verdict, summary, reason and findings with file, line, whether it blocks, severity and
     origin), as collie's review steps ask. Codex is also held to that shape (`--output-schema` / `-o`). collie-agent
     checks the answer and sends it to collie with the session's end;
-  - output goes to `<profile dir>/sessions/<id>/agent.log`, next to the session's private files (MCP config, hooks). When the agent exits (or the token dies, or the service
-    stops, which stops it) collie-agent reports the exit code, stops the processes still running in the worktree (whatever the agent left outside its process group, such as a `nohup … &` or a dev server that daemonizes: SIGTERM, then SIGKILL after 5 seconds) and removes the worktree and the branch it created.
-    Leftover worktrees from a crash are removed when `run` starts. Lifecycle reports never hold the agent up.
+  - output goes to `<profile dir>/sessions/<id>/agent.log`, next to the session's private files (MCP config, hooks)
+    and its record, `session.json` (0600: repo, worktree, branch, the dispatch, agent, permission mode and the agent's
+    own session id; never the session token). When the agent exits (or the token dies, or it sat idle) collie-agent
+    reports the exit code, stops the processes still running in the worktree (whatever the agent left outside its process group, such as a `nohup … &` or a dev server that daemonizes: SIGTERM, then SIGKILL after 5 seconds) and removes the worktree and the branch it created.
+    Lifecycle reports never hold the agent up.
+  - **Restarts and reboots.** Claude Code sessions start with `--session-id <uuid>`, and collie-agent notes the Codex
+    thread id (`thread.started`), so a session can be resumed. When the service stops (SIGTERM/SIGINT: a restart, an
+    upgrade, a reboot) collie-agent stops each agent and reports it to collie as *suspended*, keeping its worktree,
+    branch and record. When `run` starts again, before it takes new work, it picks up every session the last run left
+    (after a graceful stop or a crash): it lists them in its first heartbeat so collie keeps them, stops whatever still
+    runs in their worktrees, asks collie for a new session token (`POST sessions/:id/token/reissue`), checks that the
+    worktree, its branch and the agent's transcript are still there, and runs the agent again in the same worktree
+    with the same flags: `claude --resume <uuid> --remote-control …` or `codex exec resume <thread> --json …`. The
+    prompt is "continue", with the instruction to first check with collie (`claim_task`, `get_goal`) that the task is
+    still its own and to stop if it is not. collie hears *resumed* (with the new claude.ai link). A session that
+    cannot be resumed is reported as *resume_failed* with the reason and cleaned up; one collie no longer holds is only
+    cleaned up. Resumed sessions count against `max_concurrency`. `collie-agent status` lists them (`Restored:`).
   - The agent runs as your OS user, with your access: bind only repos you trust collie's work in.
 - A 401 anywhere, session endpoints included, means the machine was revoked: everything stops.
 
@@ -274,8 +288,10 @@ collie-agent talks to collie over HTTPS:
 - `wss://<server>/cable` (bearer token, `Origin: <server>`, `MachineChannel`: `dispatch` and
   `{type: "codebases_changed", codebases_version}` messages), with `GET /machine/v1/dispatches?wait=25`
   as the fallback, and `POST /machine/v1/dispatches/:id/ack {accepted, reason}`.
-- `POST /machine/v1/sessions/:id/token` (renew; 409 means the session is gone) and
-  `POST /machine/v1/sessions/:id/events` (`started` with the session URL, `finished` with the exit code).
+- `POST /machine/v1/sessions/:id/token` (renew; 409 means the session is gone),
+  `POST /machine/v1/sessions/:id/token/reissue` (a new token for a session resumed after a restart; 409 when collie no
+  longer holds it) and `POST /machine/v1/sessions/:id/events` (`started` with the session URL, `finished` with the exit
+  code, `suspended`, `resumed` with the session URL, `resume_failed` with the reason).
 
 The full contract is in collie's docs.
 

@@ -18,6 +18,10 @@ var (
 	qaPrompt string
 	//go:embed prompts/reviewer.txt
 	reviewerPrompt string
+	// resumePrompt is what a session resumed after a restart is told: continue, once collie confirms the work is
+	// still its own.
+	//go:embed prompts/resume.txt
+	resumePrompt string
 	// reviewSchema is the shape of a review agent's final answer, for agents that take one (codex --output-schema).
 	//go:embed prompts/review.schema.json
 	reviewSchema []byte

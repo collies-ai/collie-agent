@@ -22,6 +22,7 @@ import (
 
 	"github.com/creack/pty"
 
+	"github.com/collies-ai/collie-agent/internal/bindings"
 	"github.com/collies-ai/collie-agent/internal/dispatch"
 	"github.com/collies-ai/collie-agent/internal/machine"
 )
@@ -37,7 +38,22 @@ type API interface {
 	RenewSessionToken(ctx context.Context, sessionID int64) (time.Time, error)
 	SessionStarted(ctx context.Context, sessionID int64, sessionURL string) error
 	SessionFinished(ctx context.Context, sessionID int64, exitCode int, usage *machine.Usage, review json.RawMessage) error
+	// Resuming after a restart: a new token for a session collie still holds, and the suspend/resume events.
+	ReissueSessionToken(ctx context.Context, sessionID int64) (*machine.Reissued, error)
+	SessionSuspended(ctx context.Context, sessionID int64) error
+	SessionResumed(ctx context.Context, sessionID int64, sessionURL string) error
+	SessionResumeFailed(ctx context.Context, sessionID int64, reason string) error
 }
+
+// Adopter takes a resumed session into the dispatcher's count: it shows in the heartbeat's running sessions and holds
+// a slot like any other. done frees it.
+type Adopter interface {
+	Adopt(sessionID, runnerID int64, purpose string) (done func(), err error)
+}
+
+// ResumeNote is told what happened to each session found at startup: status "resuming", "resumed" or "failed" (with
+// the reason).
+type ResumeNote func(sessionID int64, status, reason string)
 
 // Manager runs sessions. It implements dispatch.Sessions.
 type Manager struct {
@@ -71,11 +87,16 @@ type Manager struct {
 	AnswerSettle time.Duration
 	AnswerKeyGap time.Duration
 	ExitGrace    time.Duration
+	// ResumeURLWait is how long a resumed interactive agent gets to show its session link before the resumed event goes
+	// out without one (default 30 seconds).
+	ResumeURLWait time.Duration
 
-	mu        sync.Mutex
-	running   map[int64]bool
-	onRevoked func(error)
-	wg        sync.WaitGroup
+	mu         sync.Mutex
+	running    map[int64]bool
+	onRevoked  func(error)
+	isRevoked  bool
+	resumeNote ResumeNote
+	wg         sync.WaitGroup
 }
 
 // OnRevoked sets what to call when a session endpoint answers 401: the machine was revoked, so the whole runner stops,
@@ -89,6 +110,7 @@ func (m *Manager) OnRevoked(f func(error)) {
 func (m *Manager) revoked(err error) {
 	m.mu.Lock()
 	f := m.onRevoked
+	m.isRevoked = true
 	m.mu.Unlock()
 	if f != nil {
 		f(err)
@@ -151,6 +173,160 @@ func (m *Manager) Sweep(ctx context.Context) {
 	}
 }
 
+// Resume picks up the sessions a previous run left on disk, before new work is taken: each session whose record can
+// resume it is adopted (it shows in the heartbeat's running sessions and holds a slot), gets a new token from collie
+// and runs again in its worktree with `claude --resume` or `codex exec resume`. A session that cannot be resumed is
+// reported as resume_failed with the reason and cleaned up; one collie no longer holds is only cleaned up. Folders
+// that are no session at all are swept. The work runs in the background; Resume returns once every session is adopted.
+func (m *Manager) Resume(ctx context.Context, adopt Adopter, note ResumeNote) {
+	m.mu.Lock()
+	m.resumeNote = note
+	m.mu.Unlock()
+	entries, err := os.ReadDir(m.Dir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			m.logf("reading the sessions left by the last run: %v", err)
+		}
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || m.isRunning(e.Name()) {
+			continue
+		}
+		dir := filepath.Join(m.Dir, e.Name())
+		id, idErr := strconv.ParseInt(e.Name(), 10, 64)
+		if idErr != nil || id <= 0 {
+			m.logf("removing %s: not a session", dir)
+			m.cleanup(0, dir)
+			continue
+		}
+		rec, err := readMeta(dir)
+		var reason string
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			reason = "collie-agent stopped before the session was set up"
+		case err != nil:
+			reason = "its session record cannot be read: " + err.Error()
+		case rec.SessionID == 0:
+			reason = "it was recorded by a collie-agent that could not resume sessions"
+		case rec.SessionID != id:
+			reason = fmt.Sprintf("its session record is about session %d", rec.SessionID)
+		case !rec.resumable():
+			reason = "the agent had not started yet"
+		}
+		if reason == "" {
+			reason = m.adopt(ctx, id, dir, rec, adopt)
+		}
+		if reason != "" {
+			m.resumeFailed(ctx, id, dir, "could not resume: "+reason)
+		}
+	}
+}
+
+// adopt takes a resumable session in and resumes it in the background. It returns why it cannot, or "".
+func (m *Manager) adopt(ctx context.Context, id int64, dir string, rec worktreeMeta, adopt Adopter) string {
+	a, path, err := m.adapter(rec.Agent)
+	if err != nil {
+		return err.Error()
+	}
+	var done func()
+	if adopt != nil {
+		if done, err = adopt.Adopt(id, rec.Dispatch.RunnerID, rec.Dispatch.Purpose); err != nil {
+			return err.Error()
+		}
+	}
+	m.mu.Lock()
+	if m.running == nil {
+		m.running = map[int64]bool{}
+	}
+	m.running[id] = true
+	m.mu.Unlock()
+	m.noteResume(id, "resuming", "")
+	m.logf("session %d: resuming it (%s, %s)", id, rec.Agent, rec.AgentSession)
+	m.launch(id, done, func() { m.resume(ctx, id, dir, rec, a, path) })
+	return ""
+}
+
+// resumeFailed reports in the background that a session could not be resumed, and cleans it up.
+func (m *Manager) resumeFailed(ctx context.Context, id int64, dir, reason string) {
+	m.logf("session %d: %s", id, reason)
+	m.noteResume(id, "failed", reason)
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.report(ctx, id, "resume_failed", func(c context.Context) error { return m.API.SessionResumeFailed(c, id, reason) })
+		m.cleanup(id, dir)
+	}()
+}
+
+// resume stops what the last run left in the worktree, gets a new token and runs the session again.
+func (m *Manager) resume(ctx context.Context, id int64, dir string, rec worktreeMeta, a Adapter, binary string) {
+	if fi, err := os.Stat(rec.Worktree); err == nil && fi.IsDir() && ownedWorktree(rec.Repo, dir, rec.Worktree) {
+		if n := stopProcessesIn(ctx, rec.Worktree); n > 0 {
+			m.logf("session %d: stopped %d process(es) the last run left in its worktree", id, n)
+		}
+	}
+	tok, err := m.reissue(ctx, id)
+	switch {
+	case err == nil:
+	case errors.Is(err, machine.ErrGone):
+		reason := "collie no longer holds this session"
+		m.logf("session %d: not resumed, %s: %v", id, reason, err)
+		m.noteResume(id, "failed", reason)
+		m.cleanup(id, dir)
+		return
+	case errors.Is(err, machine.ErrRevoked):
+		m.revoked(err)
+		m.noteResume(id, "failed", "the machine was revoked")
+		m.cleanup(id, dir)
+		return
+	case ctx.Err() != nil:
+		return // shut down again: it stays suspended for the next start
+	default:
+		reason := "could not resume: no new session token: " + err.Error()
+		m.logf("session %d: %s", id, reason)
+		m.noteResume(id, "failed", reason)
+		m.report(ctx, id, "resume_failed", func(c context.Context) error { return m.API.SessionResumeFailed(c, id, reason) })
+		m.cleanup(id, dir)
+		return
+	}
+	s := dispatch.Session{
+		ID:       id,
+		Dispatch: *rec.Dispatch,
+		Agent:    rec.Agent,
+		Binding: bindings.Binding{Binding: machine.Binding{RunnerID: rec.Dispatch.RunnerID, Project: rec.Dispatch.Project,
+			Codebase: rec.Dispatch.Codebase, Folder: rec.Repo, PermissionMode: rec.PermissionMode}},
+		Accepted: machine.Accepted{SessionID: id, DispatchID: rec.Dispatch.DispatchID, MCPURL: tok.MCPURL, SessionToken: tok.Token, ExpiresAt: tok.ExpiresAt},
+	}
+	m.run(ctx, s, a, binary, &rec)
+}
+
+// reissue asks collie for a new session token, retrying network errors for a while: right after a reboot the network
+// may not be up yet.
+func (m *Manager) reissue(ctx context.Context, id int64) (*machine.Reissued, error) {
+	wait := m.RetryWait
+	if wait <= 0 {
+		wait = 2 * time.Second
+	}
+	var err error
+	for attempt := 1; attempt <= 8; attempt++ {
+		var tok *machine.Reissued
+		c, cancel := context.WithTimeout(ctx, 30*time.Second)
+		tok, err = m.API.ReissueSessionToken(c, id)
+		cancel()
+		if err == nil || errors.Is(err, machine.ErrGone) || errors.Is(err, machine.ErrRevoked) || ctx.Err() != nil {
+			return tok, err
+		}
+		m.logf("session %d: getting a new token (attempt %d): %v", id, attempt, err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait * time.Duration(attempt)):
+		}
+	}
+	return nil, err
+}
+
 // Wait waits for every session to end and be cleaned up (after ctx was cancelled, on shutdown).
 func (m *Manager) Wait() { m.wg.Wait() }
 
@@ -174,43 +350,56 @@ func (m *Manager) Start(ctx context.Context, s dispatch.Session, done func()) er
 	}
 	m.running[s.ID] = true
 	m.mu.Unlock()
+	m.launch(s.ID, done, func() { m.run(ctx, s, a, path, nil) })
+	return nil
+}
 
+// launch runs f in the background for a session that holds a slot in m.running, then frees the slot and calls done.
+func (m *Manager) launch(id int64, done func(), f func()) {
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
 		defer func() {
 			m.mu.Lock()
-			delete(m.running, s.ID)
+			delete(m.running, id)
 			m.mu.Unlock()
 			if done != nil {
 				done()
 			}
 		}()
-		m.run(ctx, s, a, path)
+		f()
 	}()
-	return nil
 }
 
+// notStarted is an error from before the agent process started.
+type notStarted struct{ error }
+
+func (e notStarted) Unwrap() error { return e.error }
+
 // run is one session from worktree to cleanup. Its lifecycle events go out through one queue, in order, so a slow
-// collie never holds up the agent, its output or its supervision.
-func (m *Manager) run(ctx context.Context, s dispatch.Session, a Adapter, binary string) {
+// collie never holds up the agent, its output or its supervision. resume is the record of a session resumed after a
+// restart (nil for a new one): it runs again in its worktree, and a failure before the agent starts is reported as
+// resume_failed.
+//
+// A graceful shutdown (ctx cancelled) of a session that can be resumed suspends it instead: collie is told so and its
+// worktree, branch and session dir stay for the next start.
+func (m *Manager) run(ctx context.Context, s dispatch.Session, a Adapter, binary string, resume *worktreeMeta) {
 	dir := filepath.Join(m.Dir, strconv.FormatInt(s.ID, 10))
 	// The folder was resolved and checked against the root folders when the offer was accepted: use that path as is,
 	// without resolving it again. The worktree goes inside it (WorktreePath).
 	worktree := WorktreePath(s.Binding.Folder, s.ID)
+	if resume != nil {
+		worktree = resume.Worktree
+	}
+	keep := false
 	defer func() {
-		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		stopped, err := removeWorktree(cctx, dir)
-		if stopped > 0 {
-			m.logf("session %d: stopped %d process(es) still running in its worktree", s.ID, stopped)
+		if keep {
+			return
 		}
-		if err != nil {
-			m.logf("session %d: removing the worktree: %v", s.ID, err)
-		}
+		m.cleanup(s.ID, dir)
 	}()
 
-	events := make(chan func(), 4) // at most started, started with the link, finished: emit never blocks
+	events := make(chan func(), 4) // at most started (resumed), started with the link, finished: emit never blocks
 	sent := make(chan struct{})
 	go func() {
 		defer close(sent)
@@ -221,45 +410,123 @@ func (m *Manager) run(ctx context.Context, s dispatch.Session, a Adapter, binary
 	emit := func(event string, send func(context.Context) error) {
 		events <- func() { m.report(ctx, s.ID, event, send) }
 	}
+	defer func() {
+		close(events)
+		<-sent
+	}()
 
-	exitCode, usage, err := m.execute(ctx, s, a, binary, dir, worktree, emit)
-	if err != nil {
-		m.logf("session %d: %v", s.ID, err)
+	exitCode, usage, suspend, err := m.execute(ctx, s, a, binary, dir, worktree, resume, emit)
+	var ns notStarted
+	switch {
+	case resume != nil && errors.As(err, &ns) && ctx.Err() != nil:
+		// Shut down again before the agent could be resumed: it stays suspended for the next start.
+		m.logf("session %d: not resumed before the shutdown; it stays suspended", s.ID)
+		keep = true
+	case resume != nil && errors.As(err, &ns):
+		m.logf("session %d: could not resume: %v", s.ID, err)
+		reason := "could not resume: " + err.Error()
+		m.noteResume(s.ID, "failed", reason)
+		emit("resume_failed", func(c context.Context) error { return m.API.SessionResumeFailed(c, s.ID, reason) })
+	case suspend:
+		if err := updateMeta(dir, func(r *worktreeMeta) { r.Usage = usage }); err != nil {
+			m.logf("session %d: saving its usage: %v", s.ID, err)
+		}
+		emit("suspended", func(c context.Context) error { return m.API.SessionSuspended(c, s.ID) })
+		keep = true
+		m.logf("session %d suspended; it resumes when collie-agent starts again", s.ID)
+	default:
+		if err != nil {
+			m.logf("session %d: %v", s.ID, err)
+		}
+		review := m.readReview(s.ID, dir)
+		emit("finished", func(c context.Context) error { return m.API.SessionFinished(c, s.ID, exitCode, usage, review) })
+		m.logf("session %d finished with exit code %d", s.ID, exitCode)
 	}
-	review := m.readReview(s.ID, dir)
-	emit("finished", func(c context.Context) error { return m.API.SessionFinished(c, s.ID, exitCode, usage, review) })
-	close(events)
-	<-sent
-	m.logf("session %d finished with exit code %d", s.ID, exitCode)
+}
+
+// cleanup removes a session's worktree, branch and directory.
+func (m *Manager) cleanup(id int64, dir string) {
+	cctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	stopped, err := removeWorktree(cctx, dir)
+	if stopped > 0 {
+		m.logf("session %d: stopped %d process(es) still running in its worktree", id, stopped)
+	}
+	if err != nil {
+		m.logf("session %d: removing the worktree: %v", id, err)
+	}
+}
+
+func (m *Manager) noteResume(id int64, status, reason string) {
+	m.mu.Lock()
+	f := m.resumeNote
+	m.mu.Unlock()
+	if f != nil {
+		f(id, status, reason)
+	}
+}
+
+func (m *Manager) revokedNow() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.isRevoked
 }
 
 // execute prepares the worktree, runs the agent until it exits (or ctx ends, its token dies or it sits idle) and
-// returns its exit code (-1 when it never ran or was killed) and the usage its output reported.
-func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, binary, dir, worktree string, emit func(string, func(context.Context) error)) (int, *machine.Usage, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return -1, nil, err
-	}
-	branch := fmt.Sprintf("collie/session-%d", s.ID)
-	if err := addWorktree(ctx, s.Binding.Folder, dir, worktree, branch); err != nil {
-		return -1, nil, fmt.Errorf("creating the worktree: %w", err)
-	}
-	if err := m.setup(ctx, s, worktree); err != nil {
-		return -1, nil, err
+// returns its exit code (-1 when it never ran or was killed), the usage its output reported and whether it was stopped
+// by a graceful shutdown with what it needs to be resumed (suspend). An error from before the agent started is a
+// notStarted. A resumed session (resume) runs again in its worktree, on the resume prompt.
+func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, binary, dir, worktree string, resume *worktreeMeta, emit func(string, func(context.Context) error)) (int, *machine.Usage, bool, error) {
+	fail := func(err error) (int, *machine.Usage, bool, error) { return -1, nil, false, notStarted{err} }
+	var agentSession, prompt string
+	payload := payloadText(s.Dispatch)
+	if resume == nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fail(err)
+		}
+		agentSession = a.NewSessionID()
+		d := s.Dispatch
+		if err := updateMeta(dir, func(r *worktreeMeta) {
+			r.SessionID, r.Dispatch, r.Agent, r.PermissionMode, r.AgentSession = s.ID, &d, s.Agent, s.Binding.PermissionMode, agentSession
+			if d.Purpose == "reviewer" {
+				r.ReviewSchema, r.ReviewFile = filepath.Join(dir, "review.schema.json"), filepath.Join(dir, ReviewFile)
+			}
+		}); err != nil {
+			return fail(fmt.Errorf("writing the session record: %w", err))
+		}
+		branch := fmt.Sprintf("collie/session-%d", s.ID)
+		if err := addWorktree(ctx, s.Binding.Folder, dir, worktree, branch); err != nil {
+			return fail(fmt.Errorf("creating the worktree: %w", err))
+		}
+		if err := m.setup(ctx, s, worktree); err != nil {
+			return fail(err)
+		}
+		prompt = PromptFor(s.Dispatch.Purpose, payload)
+	} else {
+		if err := checkResumable(ctx, *resume, dir, a); err != nil {
+			return fail(err)
+		}
+		// The idle and startup clocks start again: the markers are the previous run's.
+		_ = os.Remove(filepath.Join(dir, ActivityFile))
+		_ = os.Remove(filepath.Join(dir, IdleFile))
+		if err := updateMeta(dir, func(r *worktreeMeta) { r.Resumes++ }); err != nil {
+			return fail(fmt.Errorf("writing the session record: %w", err))
+		}
+		agentSession, prompt = resume.AgentSession, resumePrompt
 	}
 	name := fmt.Sprintf("collie %s #%d", s.Dispatch.Project, s.ID)
-	payload := payloadText(s.Dispatch)
 	spec, err := a.Command(Launch{
-		Name: name, Worktree: worktree, Prompt: PromptFor(s.Dispatch.Purpose, payload), MCPURL: mcpURL(s),
+		Name: name, Worktree: worktree, Prompt: prompt, MCPURL: mcpURL(s),
 		PermissionMode: s.Binding.PermissionMode, Purpose: s.Dispatch.Purpose, Binary: binary, TokenEnv: TokenEnv, SessionDir: dir,
-		PhoneNotifications: m.PhoneNotifications,
+		PhoneNotifications: m.PhoneNotifications, AgentSession: agentSession, Resume: resume != nil,
 	})
 	if err != nil {
-		return -1, nil, err
+		return fail(err)
 	}
 
 	logFile, err := os.OpenFile(filepath.Join(dir, "agent.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return -1, nil, err
+		return fail(err)
 	}
 	defer logFile.Close()
 
@@ -272,7 +539,7 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 		// verdict to COLLIE_REVIEW_FILE (codex is also held to it by --output-schema), and readReview sends it.
 		schema, err := writeReviewSchema(dir)
 		if err != nil {
-			return -1, nil, err
+			return fail(err)
 		}
 		cmd.Env = append(cmd.Env, "COLLIE_REVIEW_FILE="+filepath.Join(dir, ReviewFile), "COLLIE_REVIEW_SCHEMA="+schema)
 	}
@@ -285,7 +552,7 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 		// A new session with the terminal as its controlling one: the agent leads its own process group.
 		tty, err = pty.StartWithSize(cmd, &pty.Winsize{Rows: 50, Cols: 220})
 		if err != nil {
-			return -1, nil, fmt.Errorf("starting %s: %w", a.Binary(), err)
+			return fail(fmt.Errorf("starting %s: %w", a.Binary(), err))
 		}
 		defer tty.Close()
 		out = tty
@@ -296,13 +563,38 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 		cmd.Stdout, cmd.Stderr = pipeW, pipeW
 		if err := cmd.Start(); err != nil {
 			pipeW.Close()
-			return -1, nil, fmt.Errorf("starting %s: %w", a.Binary(), err)
+			return fail(fmt.Errorf("starting %s: %w", a.Binary(), err))
 		}
 		out = r
 	}
 	started := time.Now()
-	m.logf("session %d: started %s in %s (%s)", s.ID, a.Binary(), worktree, payload)
-	emit("started", func(c context.Context) error { return m.API.SessionStarted(c, s.ID, "") })
+	// A resumed session sends one resumed event (collie counts each one): with the session link when the agent shows
+	// one soon enough, else without it.
+	var resumedOnce sync.Once
+	resumed := func(url string) {
+		resumedOnce.Do(func() {
+			m.noteResume(s.ID, "resumed", "")
+			emit("resumed", func(c context.Context) error { return m.API.SessionResumed(c, s.ID, url) })
+		})
+	}
+	var resumeWait <-chan time.Time
+	if resume != nil {
+		m.logf("session %d: resumed %s in %s (%s)", s.ID, a.Binary(), worktree, payload)
+		if spec.TTY {
+			wait := m.ResumeURLWait
+			if wait <= 0 {
+				wait = 30 * time.Second
+			}
+			t := time.NewTimer(wait)
+			defer t.Stop()
+			resumeWait = t.C
+		} else {
+			resumed("")
+		}
+	} else {
+		m.logf("session %d: started %s in %s (%s)", s.ID, a.Binary(), worktree, payload)
+		emit("started", func(c context.Context) error { return m.API.SessionStarted(c, s.ID, "") })
+	}
 
 	waited := make(chan error, 1)
 	go func() {
@@ -319,6 +611,10 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 		obs        Observed
 		lastOutput atomic.Int64
 	)
+	if resume != nil && resume.Usage != nil {
+		u := *resume.Usage // what the agent reported before it was suspended
+		obs.Usage = &u
+	}
 	lastOutput.Store(time.Now().UnixNano())
 	scanned := make(chan struct{})
 	go func() {
@@ -335,12 +631,22 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 			if strings.TrimSpace(text) != "" {
 				fmt.Fprintln(logFile, text)
 			}
-			hadURL := obs.URL != ""
+			hadURL, hadThread := obs.URL != "", obs.Thread != ""
 			a.Observe(raw, &obs)
 			if !hadURL && obs.URL != "" {
 				url := obs.URL
 				m.logf("session %d: %s", s.ID, url)
-				emit("started", func(c context.Context) error { return m.API.SessionStarted(c, s.ID, url) })
+				if resume != nil {
+					resumed(url)
+				} else {
+					emit("started", func(c context.Context) error { return m.API.SessionStarted(c, s.ID, url) })
+				}
+			}
+			if !hadThread && obs.Thread != "" && resume == nil {
+				thread := obs.Thread
+				if err := updateMeta(dir, func(r *worktreeMeta) { r.AgentSession = thread }); err != nil {
+					m.logf("session %d: saving its thread id: %v", s.ID, err)
+				}
 			}
 			for i, ans := range spec.Answers {
 				if answered[i] || tty == nil || !m.startingUp(dir, started) {
@@ -384,16 +690,22 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 		tick = t.C
 	}
 
-	var waitErr error
+	var (
+		waitErr  error
+		shutdown bool
+	)
 loop:
 	for {
 		select {
 		case waitErr = <-waited:
 			break loop
+		case <-resumeWait:
+			resumed("")
 		case <-ctx.Done():
 			m.logf("session %d: stopping the agent (%v)", s.ID, ctx.Err())
 			m.stop(cmd, waited)
 			waitErr = errors.New("stopped")
+			shutdown = true
 			break loop
 		case err := <-tokenDead:
 			m.logf("session %d: stopping the agent, its token is no longer valid: %v", s.ID, err)
@@ -417,7 +729,36 @@ loop:
 		}
 		<-scanned
 	}
-	return exitCode(cmd, waitErr), obs.Usage, nil
+	if resume != nil {
+		resumed("") // it ended before showing its link: collie hears of the resume before the end
+	}
+	suspend := false
+	if shutdown && !m.revokedNow() {
+		r, err := readMeta(dir)
+		suspend = err == nil && r.resumable() && a.HasTranscript(r.AgentSession)
+	}
+	return exitCode(cmd, waitErr), obs.Usage, suspend, nil
+}
+
+// checkResumable checks that what a resume needs is still there: the worktree (a session worktree, still on the
+// session's branch) and the agent's transcript of the session.
+func checkResumable(ctx context.Context, r worktreeMeta, dir string, a Adapter) error {
+	if !ownedWorktree(r.Repo, dir, r.Worktree) {
+		return fmt.Errorf("%s is not a session worktree", r.Worktree)
+	}
+	if fi, err := os.Stat(r.Worktree); err != nil || !fi.IsDir() {
+		return fmt.Errorf("its worktree %s is gone", r.Worktree)
+	}
+	if _, err := git(ctx, r.Repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+r.Branch); err != nil {
+		return fmt.Errorf("its branch %s is gone", r.Branch)
+	}
+	if head, err := git(ctx, r.Worktree, "rev-parse", "--abbrev-ref", "HEAD"); err != nil || head != r.Branch {
+		return fmt.Errorf("its worktree is not on branch %s", r.Branch)
+	}
+	if !a.HasTranscript(r.AgentSession) {
+		return fmt.Errorf("%s kept no transcript of session %s", a.Binary(), r.AgentSession)
+	}
+	return nil
 }
 
 // startingUp reports whether the agent is still starting: it did no work yet (its hooks never marked activity) and

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ import (
 	"github.com/collies-ai/collie-agent/internal/discovery"
 	"github.com/collies-ai/collie-agent/internal/dispatch"
 	"github.com/collies-ai/collie-agent/internal/machine"
+	"github.com/collies-ai/collie-agent/internal/session"
 )
 
 type ackRec struct {
@@ -672,5 +674,40 @@ func TestDiscoveredReposAreAllowedOnlyWithDiscover(t *testing.T) {
 		if on != (len(inv) == 1) {
 			t.Errorf("discover %v: inventory = %+v", on, inv)
 		}
+	}
+}
+
+// resumingSessions resumes session 77 at startup, as session.Manager does with what the last run left.
+type resumingSessions struct{ recSessions }
+
+func (s *resumingSessions) Resume(_ context.Context, a session.Adopter, note session.ResumeNote) {
+	if _, err := a.Adopt(77, 11, "code"); err != nil {
+		panic(err)
+	}
+	note(77, "resuming", "")
+	note(77, "resumed", "")
+	note(78, "failed", "could not resume: its worktree is gone")
+}
+
+func TestResumedSessionsAreInTheFirstHeartbeatAndTheState(t *testing.T) {
+	f := newFakeCollie(t)
+	r, _, _ := setup(t, f)
+	r.Sessions = &resumingSessions{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Loop(ctx) }()
+	waitFor(t, "a heartbeat", func() bool { f.mu.Lock(); defer f.mu.Unlock(); return len(f.heartbeats) > 0 })
+	cancel()
+	<-done
+	f.mu.Lock()
+	first := f.heartbeats[0]
+	f.mu.Unlock()
+	if !slices.Equal(first.Running, []string{"77"}) {
+		t.Errorf("first heartbeat running = %v, want the resumed session", first.Running)
+	}
+	st, _ := r.Profile.LoadState()
+	if len(st.Resumed) != 2 || st.Resumed[0].SessionID != 77 || st.Resumed[0].Status != "resumed" ||
+		st.Resumed[1].Status != "failed" || !strings.Contains(st.Resumed[1].Reason, "worktree") {
+		t.Errorf("state resumed = %+v", st.Resumed)
 	}
 }

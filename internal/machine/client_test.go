@@ -123,3 +123,43 @@ func TestSessionFinishedSendsTheReview(t *testing.T) {
 		t.Error("a finished event without a review sent the field")
 	}
 }
+
+func TestResumeEndpoints(t *testing.T) {
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = append(got, r.URL.Path+" "+strings.TrimSpace(string(b)))
+		switch r.URL.Path {
+		case "/machine/v1/sessions/7/token/reissue":
+			_, _ = w.Write([]byte(`{"session_id":7,"token":"cms_new","expires_at":"2026-11-26T20:00:00Z","mcp_url":"https://c.test/p/x/mcp"}`))
+		case "/machine/v1/sessions/8/token/reissue":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":"gone"}`))
+		default:
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "tok", "test")
+	ctx := context.Background()
+	r, err := c.ReissueSessionToken(ctx, 7)
+	if err != nil || r.Token != "cms_new" || r.MCPURL != "https://c.test/p/x/mcp" || r.ExpiresAt.IsZero() {
+		t.Fatalf("reissue = %+v, %v", r, err)
+	}
+	if _, err := c.ReissueSessionToken(ctx, 8); !errors.Is(err, ErrGone) {
+		t.Errorf("reissue of a gone session: %v, want ErrGone", err)
+	}
+	_ = c.SessionSuspended(ctx, 7)
+	_ = c.SessionResumed(ctx, 7, "https://claude.ai/code/session_x")
+	_ = c.SessionResumeFailed(ctx, 7, strings.Repeat("r", 1200))
+	want := []string{
+		`/machine/v1/sessions/7/events {"event":"suspended"}`,
+		`/machine/v1/sessions/7/events {"event":"resumed","session_url":"https://claude.ai/code/session_x"}`,
+		`/machine/v1/sessions/7/events {"event":"resume_failed","reason":"` + strings.Repeat("r", 1000) + `"}`,
+	}
+	for i, w := range want {
+		if got[i+2] != w {
+			t.Errorf("event %d = %s\nwant %s", i, got[i+2], w)
+		}
+	}
+}
