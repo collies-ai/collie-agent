@@ -129,9 +129,19 @@ func (l *Launchd) Install(s Spec) error {
 		return err
 	}
 	// A previous version may be loaded: unload it first, ignoring "not loaded".
-	_, _ = l.Run("launchctl", "bootout", l.domain()+"/"+l.Name())
+	_, _ = l.Run("launchctl", "bootout", l.target())
 	l.waitUntilGone()
+	return l.bootstrap()
+}
+
+// target is the service target of launchctl: gui/<uid>/<label>.
+func (l *Launchd) target() string { return l.domain() + "/" + l.Name() }
+
+// bootstrap loads the plist, retrying while launchd is still tearing down a job that was just booted out. If it still
+// fails the error says how to load the agent by hand.
+func (l *Launchd) bootstrap() error {
 	var out string
+	var err error
 	for attempt := 0; ; attempt++ {
 		out, err = l.Run("launchctl", "bootstrap", l.domain(), l.Path())
 		if err == nil {
@@ -152,6 +162,83 @@ func (l *Launchd) Install(s Spec) error {
 	}
 	return fmt.Errorf("launchctl bootstrap: %v: %s\nThe agent is not loaded. Load it with: launchctl bootstrap %s %s",
 		err, out, l.domain(), shellQuote(l.Path()))
+}
+
+// loaded asks launchctl print whether launchd knows the label. Only launchd's own "not found" means no: any other
+// failure leaves the state unknown and is returned.
+func (l *Launchd) loaded() (bool, error) {
+	out, err := l.Run("launchctl", "print", l.target())
+	if err == nil {
+		return true, nil
+	}
+	if launchdNotFound(out, err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("launchctl print %s: %v: %s", l.target(), err, out)
+}
+
+// installed reports whether the plist exists.
+func (l *Launchd) installed() bool {
+	_, err := os.Stat(l.Path())
+	return err == nil
+}
+
+// Start loads the plist when launchd does not know the agent (stopped, or never loaded since login), and otherwise
+// asks launchd to run it; an agent already running keeps running.
+func (l *Launchd) Start() error {
+	if !l.installed() {
+		return ErrNotInstalled
+	}
+	loaded, err := l.loaded()
+	if err != nil {
+		return err
+	}
+	if !loaded {
+		return l.bootstrap()
+	}
+	if out, err := l.Run("launchctl", "kickstart", l.target()); err != nil {
+		return fmt.Errorf("launchctl kickstart %s: %v: %s", l.target(), err, out)
+	}
+	return nil
+}
+
+// Stop unloads the agent (bootout), so KeepAlive does not bring it back. The plist stays: launchd loads it again at
+// the next login, or Start does.
+func (l *Launchd) Stop() error {
+	loaded, err := l.loaded()
+	if err != nil {
+		return err
+	}
+	if !loaded {
+		if !l.installed() {
+			return ErrNotInstalled
+		}
+		return nil // already stopped
+	}
+	if out, err := l.Run("launchctl", "bootout", l.target()); err != nil && !launchdNotFound(out, err) {
+		return fmt.Errorf("launchctl bootout %s: %v: %s", l.target(), err, out)
+	}
+	l.waitUntilGone()
+	return nil
+}
+
+// Restart kills the running agent and starts it again (kickstart -k), or loads it when launchd does not know it.
+// The agent gets SIGTERM, so it stops its sessions as on any shutdown.
+func (l *Launchd) Restart() error {
+	if !l.installed() {
+		return ErrNotInstalled
+	}
+	loaded, err := l.loaded()
+	if err != nil {
+		return err
+	}
+	if !loaded {
+		return l.bootstrap()
+	}
+	if out, err := l.Run("launchctl", "kickstart", "-k", l.target()); err != nil {
+		return fmt.Errorf("launchctl kickstart -k %s: %v: %s", l.target(), err, out)
+	}
+	return nil
 }
 
 // shellQuote single-quotes s for a POSIX shell when it holds anything but safe characters.

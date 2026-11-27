@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -752,5 +753,115 @@ func TestLaunchdInstallErrorQuotesThePlistPath(t *testing.T) {
 	}
 	if got := shellQuote("/Users/ana/Library/LaunchAgents/sh.collies.collie-agent.plist"); got != "/Users/ana/Library/LaunchAgents/sh.collies.collie-agent.plist" {
 		t.Errorf("a safe path was quoted: %s", got)
+	}
+}
+
+func TestLaunchdStartStopRestart(t *testing.T) {
+	p := profile(t, "")
+	home := t.TempDir()
+	target := "gui/501/sh.collies.collie-agent"
+	print := "launchctl print " + target
+	running := "state = running"
+	newLaunchd := func(f *fakeRun) *Launchd {
+		return &Launchd{Home: home, UID: 501, Run: f.run, Profile: p, Sleep: func(time.Duration) {}}
+	}
+
+	// Not installed: start and restart refuse, stop of an unknown agent too.
+	f := &fakeRun{seq: map[string][]step{print: {{"Could not find service", 113}}}}
+	l := newLaunchd(f)
+	for name, do := range map[string]func() error{"start": l.Start, "stop": l.Stop, "restart": l.Restart} {
+		if err := do(); !errors.Is(err, ErrNotInstalled) {
+			t.Errorf("%s without a plist = %v, want ErrNotInstalled", name, err)
+		}
+	}
+	if err := writeFile(l.Path(), "<plist/>"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Not loaded: start and restart bootstrap the plist; stop has nothing to do.
+	for name, do := range map[string]func(*Launchd) error{"start": (*Launchd).Start, "restart": (*Launchd).Restart} {
+		f := &fakeRun{seq: map[string][]step{print: {{"Could not find service", 113}}}}
+		if err := do(newLaunchd(f)); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		want := print + "\nlaunchctl bootstrap gui/501 " + l.Path()
+		if got := strings.Join(f.calls, "\n"); got != want {
+			t.Errorf("%s of an unloaded agent:\n%s", name, got)
+		}
+	}
+	f = &fakeRun{seq: map[string][]step{print: {{"Could not find service", 113}}}}
+	if err := newLaunchd(f).Stop(); err != nil || len(f.calls) != 1 {
+		t.Errorf("stop of an unloaded agent = %v, calls %v", err, f.calls)
+	}
+
+	// Loaded: start kickstarts, restart kickstarts -k, stop boots out and waits for launchd to let go.
+	f = &fakeRun{seq: map[string][]step{print: {{running, 0}}}}
+	if err := newLaunchd(f).Start(); err != nil || f.calls[1] != "launchctl kickstart "+target {
+		t.Errorf("start = %v, calls %v", err, f.calls)
+	}
+	f = &fakeRun{seq: map[string][]step{print: {{running, 0}}}}
+	if err := newLaunchd(f).Restart(); err != nil || f.calls[1] != "launchctl kickstart -k "+target {
+		t.Errorf("restart = %v, calls %v", err, f.calls)
+	}
+	f = &fakeRun{seq: map[string][]step{print: {{running, 0}, {"Could not find service", 113}}}}
+	if err := newLaunchd(f).Stop(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{print, "launchctl bootout " + target, print}
+	if strings.Join(f.calls, "\n") != strings.Join(want, "\n") {
+		t.Errorf("stop calls:\n%s", strings.Join(f.calls, "\n"))
+	}
+	if _, err := os.Stat(l.Path()); err != nil {
+		t.Error("stop removed the plist")
+	}
+
+	// A lookup that fails for another reason is reported, not taken for "stopped".
+	f = &fakeRun{seq: map[string][]step{print: {{"Operation not permitted", 1}}}}
+	if err := newLaunchd(f).Stop(); err == nil {
+		t.Error("stop ignored a failed lookup")
+	}
+}
+
+func TestSystemdStartStopRestart(t *testing.T) {
+	p := profile(t, "")
+	cfg := t.TempDir()
+	f := &fakeRun{exits: map[string]int{"systemctl --user stop collie-agent.service": 5}}
+	d := &Systemd{ConfigHome: cfg, Run: f.run, Profile: p}
+	for name, do := range map[string]func() error{"start": d.Start, "stop": d.Stop, "restart": d.Restart} {
+		if err := do(); !errors.Is(err, ErrNotInstalled) {
+			t.Errorf("%s without a unit = %v, want ErrNotInstalled", name, err)
+		}
+	}
+
+	if err := writeFile(d.Path(), "[Unit]\n"); err != nil {
+		t.Fatal(err)
+	}
+	f = &fakeRun{}
+	d.Run = f.run
+	if err := d.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Restart(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"systemctl --user start collie-agent.service",
+		"systemctl --user restart collie-agent.service",
+		"systemctl --user stop collie-agent.service",
+	}
+	if strings.Join(f.calls, "\n") != strings.Join(want, "\n") {
+		t.Errorf("calls:\n%s", strings.Join(f.calls, "\n"))
+	}
+	if _, err := os.Stat(d.Path()); err != nil {
+		t.Error("stop removed the unit")
+	}
+
+	f = &fakeRun{fail: map[string]bool{"systemctl --user restart collie-agent.service": true}, answers: map[string]string{"systemctl --user restart collie-agent.service": "Failed to connect to bus"}}
+	d.Run = f.run
+	if err := d.Restart(); err == nil || !strings.Contains(err.Error(), "Failed to connect to bus") {
+		t.Errorf("restart failure = %v", err)
 	}
 }

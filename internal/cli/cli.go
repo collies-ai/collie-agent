@@ -45,7 +45,8 @@ const usage = `collie-agent connects this machine to collie, so collie can wake 
 Usage:
   collie-agent pair [--server URL] [--name NAME] [--no-browser] [--force] [--discover claude,codex|none]
   collie-agent unpair
-  collie-agent service install|uninstall|status
+  collie-agent service install|uninstall|status|start|stop|restart
+  collie-agent start|stop|restart       (same as service start|stop|restart)
   collie-agent roots add|remove <folder> | roots list
   collie-agent status
   collie-agent run
@@ -132,6 +133,8 @@ func (a *App) Run(args []string) int {
 		return a.status(profile, cmdArgs)
 	case "service":
 		return a.service(profile, cmdArgs)
+	case "start", "stop", "restart":
+		return a.service(profile, append([]string{cmd}, cmdArgs...))
 	case "roots":
 		return a.roots(profile, cmdArgs)
 	default:
@@ -372,6 +375,7 @@ func (a *App) run(p config.Profile, args []string) int {
 	}
 	r := &agent.Runner{Profile: p, MachineID: creds.MachineID, API: api, Settings: settings, Log: logger, Sleep: a.RunSleep}
 	r.Discover = func(roots, sources []string) []discovery.Repo { return discovery.Discover(a.Home, sources, roots) }
+	r.ReloadSettings = p.LoadSettings
 	// The full machine API turns on discovery, bindings and dispatches; the cable is the push channel for them.
 	if remote, ok := api.(agent.Remote); ok {
 		r.Remote = remote
@@ -505,7 +509,7 @@ func (a *App) status(p config.Profile, args []string) int {
 
 func (a *App) service(p config.Profile, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(a.Stderr, "usage: collie-agent service install|uninstall|status")
+		fmt.Fprintln(a.Stderr, "usage: collie-agent service install|uninstall|status|start|stop|restart")
 		return exitUsage
 	}
 	m, err := a.serviceManager(p)
@@ -544,6 +548,26 @@ func (a *App) service(p config.Profile, args []string) int {
 		}
 		fmt.Fprintf(a.Stdout, "Stopped and removed %s.\n", m.Name())
 		return exitOK
+	case "start", "restart":
+		// An unpaired agent exits at once: say so instead of starting it.
+		if _, err := p.LoadCredentials(); err != nil {
+			return a.fail(err)
+		}
+		do, done := m.Start, "Started"
+		if args[0] == "restart" {
+			do, done = m.Restart, "Restarted"
+		}
+		if err := do(); err != nil {
+			return a.fail(err)
+		}
+		fmt.Fprintf(a.Stdout, "%s %s.\n", done, m.Name())
+		return exitOK
+	case "stop":
+		if err := m.Stop(); err != nil {
+			return a.fail(err)
+		}
+		fmt.Fprintf(a.Stdout, "Stopped %s. It starts again at your next login, or with `collie-agent service start`.\n", m.Name())
+		return exitOK
 	case "status":
 		s, err := m.Status()
 		if err != nil {
@@ -559,7 +583,7 @@ func (a *App) service(p config.Profile, args []string) int {
 		}
 		return exitOK
 	default:
-		fmt.Fprintf(a.Stderr, "collie-agent: unknown service command %q (install, uninstall or status)\n", args[0])
+		fmt.Fprintf(a.Stderr, "collie-agent: unknown service command %q (install, uninstall, status, start, stop or restart)\n", args[0])
 		return exitUsage
 	}
 }
@@ -586,7 +610,7 @@ func envFrom(getenv func(string) string) (map[string]string, error) {
 }
 
 // roots manages the root folders: the only places collie-agent looks for repos and the only places a binding may
-// point to. The running service reads them at start: restart it after a change.
+// point to. A running agent rereads config.json at every heartbeat, so a change applies without a restart.
 func (a *App) roots(p config.Profile, args []string) int {
 	if len(args) == 0 {
 		args = []string{"list"}
@@ -638,7 +662,7 @@ func (a *App) roots(p config.Profile, args []string) int {
 		if err := p.SaveSettings(s); err != nil {
 			return a.fail(err)
 		}
-		fmt.Fprintf(a.Stdout, "Root folders: %s\nRestart the service to apply it (collie-agent service install).\n", strings.Join(s.RootFolders, ", "))
+		fmt.Fprintf(a.Stdout, "Root folders: %s\nA running agent picks this up within a minute and looks for repos again.\n", strings.Join(s.RootFolders, ", "))
 		return exitOK
 	default:
 		fmt.Fprintf(a.Stderr, "collie-agent: unknown roots command %q (add, remove or list)\n", args[0])
