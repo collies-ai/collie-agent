@@ -127,6 +127,34 @@ instead.
   declines it with a reason otherwise (also when the binding's agent CLI is not installed). Reviews count only against
   their binding's `max_concurrency`, not the machine's: builds waiting for their reviews never keep the reviews from
   starting.
+- **Coordinator.** A project can run its coordinator (the agent that plans goals and reacts to their events) on this
+  machine instead of collie's own Anthropic API loop. In collie, an owner binds this machine with the purpose
+  `coordinator` and picks its agent (`claude` or `codex`) in the project's settings. That binding belongs to the whole
+  project: it has no codebase and no folder, so it needs no root folders and no repo, and a pinned `folder` is
+  ignored. collie dispatches `collie coordinate #<run>` to it, and collie-agent runs it as a coordinator session:
+  - in an empty scratch dir, `<profile dir>/sessions/<id>/work` (0700), never in a repo, with no worktree or branch;
+  - with collie's coordinator prompt (it calls `get_coordinator_run`, acts with collie's coordinator tools and closes
+    with `finish_coordinator_run`) and the job reference in `<routine-fire-payload>`;
+  - with collie's MCP tools only, whatever permission mode the binding has, and isolated from your own agent setup
+    (the session's environment holds its token, so nothing of yours runs inside it):
+    - **Claude Code** runs headless (`claude -p --output-format stream-json --verbose`, no Remote Control) with
+      `--setting-sources ""` (none of your settings files: no hooks, plugins, permission rules or env of yours),
+      `--settings` turning every hook off (`disableAllHooks`), `--tools ""` (no built-in tool: shell, files, web,
+      subagents; they are also in `--disallowedTools`), `--strict-mcp-config` with only collie's server,
+      `--allowedTools mcp__collie` and `--permission-mode dontAsk` when the CLI has it. Your claude.ai login still
+      works (it is not a setting; an `apiKeyHelper` in your settings is not used). It exits as soon as the run is
+      done, and the usage of its final `result` event goes to collie with the session's end;
+    - **Codex** runs `codex exec --json --sandbox read-only --skip-git-repo-check` with approvals off,
+      `--ignore-user-config` (none of your `config.toml`: your MCP servers, profiles and hooks; sign-in still comes from
+      `CODEX_HOME`) so collie's server is its only MCP server, `--ignore-rules`, `--disable shell_tool`, and the
+      newer exec shell, apps, plugins, hooks, browser and computer use, image tools, subagents and web search off;
+    - a CLI too old for these flags refuses to start, and the session ends with that exit code: it never runs with less
+      isolation;
+  - outside the machine-wide `max_concurrency`, like reviews: builds waiting to be planned or unblocked never keep the
+    coordinator from starting. Its binding allows one run at a time.
+
+  Coordinator sessions are never resumed after a restart: a stop reports them finished and collie runs the
+  coordinator again. `session_setup` runs for them too, under the `coordinator` purpose, in the scratch dir.
 - **Sessions.** An accepted dispatch runs as one agent session:
   - a git worktree of the bound repo in `<repo>/.claude/worktrees/collie-session-<id>` (where Claude Code's own
     `--worktree` puts them; collie-agent adds `/.claude/worktrees/` to the repo's `.git/info/exclude` when it is not
@@ -136,7 +164,7 @@ instead.
     `git remote set-head origin --auto`). A `collie/session-<id>` branch that already exists is never reused or
     deleted;
   - the agent CLI runs there with collie's runner prompt for the binding's purpose (worker, `qa-browser` or
-    `reviewer`) and the job reference appended in `<routine-fire-payload>`;
+    `reviewer`; a coordinator session runs outside any repo, see **Coordinator** above) and the job reference appended in `<routine-fire-payload>`;
   - it reaches collie's MCP server with a short-lived session token (1 hour, renewed 10 minutes before it expires)
     passed only in the `COLLIE_SESSION_TOKEN` environment variable: Claude Code gets an MCP config that references
     the variable, Codex `bearer_token_env_var`;
@@ -202,7 +230,7 @@ instead.
 ```
 
 `session_setup` runs a command in each session's worktree before its agent starts, by the dispatch's purpose (`code`,
-`research`, `reviewer`, `qa-browser`), with `COLLIE_SESSION_ID`, `COLLIE_PURPOSE`, `COLLIE_PROJECT` and `COLLIE_CODEBASE`
+`research`, `reviewer`, `qa-browser`, `coordinator`: its scratch dir), with `COLLIE_SESSION_ID`, `COLLIE_PURPOSE`, `COLLIE_PROJECT` and `COLLIE_CODEBASE`
 set: for example, a script of yours that gives the reviewer its own git and GitHub identity in that worktree. Its output
 goes to the session's log; if it fails (or runs past two minutes) the session stops before the agent starts. collie-agent
 knows nothing about what the command does.

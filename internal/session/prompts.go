@@ -6,11 +6,13 @@ package session
 import (
 	_ "embed"
 	"strings"
+
+	"github.com/collies-ai/collie-agent/internal/bindings"
 )
 
-// The fixed prompts, copied word for word from collie's Runner::WORKER_PROMPT, QA_PROMPT and REVIEWER_PROMPT
-// (jfromaniello/collie, app/models/runner.rb). The prompt lives on the machine: collie only ever sends a job
-// reference. Keep them in sync with collie when they change.
+// The fixed prompts, copied word for word from collie's Runner::WORKER_PROMPT, QA_PROMPT, REVIEWER_PROMPT and
+// COORDINATOR_PROMPT (jfromaniello/collie, app/models/runner.rb). The prompt lives on the machine: collie only ever
+// sends a job reference. Keep them in sync with collie when they change.
 var (
 	//go:embed prompts/worker.txt
 	workerPrompt string
@@ -18,6 +20,8 @@ var (
 	qaPrompt string
 	//go:embed prompts/reviewer.txt
 	reviewerPrompt string
+	//go:embed prompts/coordinator.txt
+	coordinatorPrompt string
 	// resumePrompt is what a session resumed after a restart is told: continue, once collie confirms the work is
 	// still its own.
 	//go:embed prompts/resume.txt
@@ -37,6 +41,8 @@ func PromptFor(purpose, payload string) string {
 		p = qaPrompt
 	case "reviewer":
 		p = reviewerPrompt
+	case bindings.CoordinatorPurpose:
+		p = coordinatorPrompt
 	default:
 		p = workerPrompt
 	}

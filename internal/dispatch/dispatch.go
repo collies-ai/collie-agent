@@ -162,13 +162,16 @@ func (d *Dispatcher) Handle(ctx context.Context, m machine.Dispatch) error {
 
 	// The folder was checked when the bindings synced; check it again now, so a folder (or an ancestor) swapped for
 	// a symlink since then cannot send the session outside the root folders. The roots are pinned to where they
-	// resolved at sync: a redirected root no longer counts. The session gets the fresh path.
-	folder, err := bindings.WithinPinned(b.Folder, d.allowedFolders())
-	if err != nil {
-		d.release(key)
-		return d.decline(ctx, key, m, "binding refused by the machine: "+err.Error())
+	// resolved at sync: a redirected root no longer counts. The session gets the fresh path. A coordinator binding has
+	// no folder: its session runs in a scratch dir and touches no repo.
+	if !bindings.IsCoordinator(b.Binding) {
+		folder, err := bindings.WithinPinned(b.Folder, d.allowedFolders())
+		if err != nil {
+			d.release(key)
+			return d.decline(ctx, key, m, "binding refused by the machine: "+err.Error())
+		}
+		b.Folder = folder
 	}
-	b.Folder = folder
 
 	acc, err := d.API.Ack(ctx, m.DispatchID, true, "")
 	if err != nil {
@@ -190,7 +193,11 @@ func (d *Dispatcher) Handle(ctx context.Context, m machine.Dispatch) error {
 	}
 	d.promote(key, sid, b.RunnerID)
 	s := Session{ID: sid, Dispatch: m, Binding: b, Agent: agent, Accepted: *acc}
-	d.logf("accepted dispatch %d (%s %s) as session %d with %s in %s", m.DispatchID, m.Kind, m.Reference, sid, agent, b.Folder)
+	where := b.Folder
+	if where == "" {
+		where = "a scratch dir"
+	}
+	d.logf("accepted dispatch %d (%s %s) as session %d with %s in %s", m.DispatchID, m.Kind, m.Reference, sid, agent, where)
 	if err := d.Sessions.Start(ctx, s, func() { d.finish(sid) }); err != nil {
 		d.logf("session %d did not start: %v", sid, err)
 		d.finish(sid)
@@ -241,6 +248,11 @@ func (d *Dispatcher) reserve(key int64, m machine.Dispatch) (string, bindings.Bi
 	if !b.Usable() {
 		return "binding refused by the machine: " + b.Refused, b, ""
 	}
+	// A coordinator binding takes coordinator dispatches only, and only a coordinator binding takes them: it has no
+	// folder, and the other purposes need one.
+	if bindings.IsCoordinator(b.Binding) != (m.Purpose == bindings.CoordinatorPurpose) {
+		return fmt.Sprintf("runner %d is a %s binding and does not take %q dispatches", m.RunnerID, purposeName(b.Purpose), m.Purpose), b, ""
+	}
 	agent := agentFor(b, m.Purpose)
 	if agent == "" {
 		return fmt.Sprintf("no agent configured for purpose %q", m.Purpose), b, ""
@@ -278,14 +290,14 @@ type slot struct {
 
 // uncappedPurposes are the purposes whose sessions neither count against the machine-wide MaxConcurrency nor wait for
 // it: only their binding's limit applies. A review is short, and the builds holding the machine's slots are often the
-// ones waiting for it; collie counts the same way (MachineDelivery::UNCAPPED_PURPOSES).
-var uncappedPurposes = map[string]bool{"reviewer": true}
+// ones waiting for it; so is the coordinator, which the builds wait on to be planned and unblocked. collie counts the
+// same way (MachineDelivery::UNCAPPED_PURPOSES).
+var uncappedPurposes = map[string]bool{"reviewer": true, bindings.CoordinatorPurpose: true}
 
 // Uncapped says whether sessions of this purpose are left out of the machine-wide MaxConcurrency. The session manager
 // asks it too, so the limit is counted the same way when the offer is acked and when the session starts.
 func Uncapped(purpose string) bool { return uncappedPurposes[purpose] }
 
-// agentFor picks the binding's agent for a purpose; "code" is collie's default purpose.
 // agentFor is the binding's agent for the dispatch's purpose. Research with no research agent of its own runs on the
 // code agent: collie offers research to a codebase's code bindings when it has no research binding (RunnerPool), and
 // the worker prompt takes "collie research #N".
@@ -297,6 +309,14 @@ func agentFor(b bindings.Binding, purpose string) string {
 		return agent
 	}
 	return b.Agents["code"]
+}
+
+// purposeName is a binding's purpose as people read it; collie's default purpose is code.
+func purposeName(purpose string) string {
+	if purpose == "" {
+		return "code"
+	}
+	return purpose
 }
 
 func (d *Dispatcher) release(key int64) {

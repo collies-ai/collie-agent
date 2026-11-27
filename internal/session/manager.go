@@ -226,6 +226,8 @@ func (m *Manager) Resume(ctx context.Context, adopt Adopter, note ResumeNote) {
 			reason = "it was recorded by a collie-agent that could not resume sessions"
 		case rec.SessionID != id:
 			reason = fmt.Sprintf("its session record is about session %d", rec.SessionID)
+		case rec.Dispatch != nil && rec.Dispatch.Purpose == bindings.CoordinatorPurpose:
+			reason = "coordinator sessions are not resumed; collie runs the coordinator again"
 		case !rec.resumable():
 			reason = "the agent had not started yet"
 		}
@@ -420,8 +422,11 @@ func (m *Manager) run(ctx context.Context, s dispatch.Session, a Adapter, binary
 	// The folder was resolved and checked against the root folders when the offer was accepted: use that path as is,
 	// without resolving it again. The worktree goes inside it (WorktreePath).
 	worktree := WorktreePath(s.Binding.Folder, s.ID)
-	if resume != nil {
+	switch {
+	case resume != nil:
 		worktree = resume.Worktree
+	case repoless(s):
+		worktree = ScratchPath(dir)
 	}
 	keep := false
 	defer func() {
@@ -526,9 +531,18 @@ func (m *Manager) execute(ctx context.Context, s dispatch.Session, a Adapter, bi
 		}); err != nil {
 			return fail(fmt.Errorf("writing the session record: %w", err))
 		}
-		branch := fmt.Sprintf("collie/session-%d", s.ID)
-		if err := addWorktree(ctx, s.Binding.Folder, dir, worktree, branch); err != nil {
-			return fail(fmt.Errorf("creating the worktree: %w", err))
+		if repoless(s) {
+			// No repo: the agent runs in an empty scratch dir inside the session dir, which cleanup removes with it. The
+			// record has no repo, worktree or branch, so the session is never resumed: a coordinator run that a restart
+			// cut short is collie's to run again.
+			if err := os.MkdirAll(worktree, 0o700); err != nil {
+				return fail(fmt.Errorf("creating the scratch dir: %w", err))
+			}
+		} else {
+			branch := fmt.Sprintf("collie/session-%d", s.ID)
+			if err := addWorktree(ctx, s.Binding.Folder, dir, worktree, branch); err != nil {
+				return fail(fmt.Errorf("creating the worktree: %w", err))
+			}
 		}
 		if err := m.setup(ctx, s, worktree); err != nil {
 			return fail(err)
@@ -1062,6 +1076,14 @@ func (m *Manager) report(ctx context.Context, sessionID int64, event string, sen
 		time.Sleep(wait * time.Duration(attempt))
 	}
 }
+
+// repoless reports whether the session works without a repo: a coordinator session, which only uses collie's MCP.
+func repoless(s dispatch.Session) bool {
+	return s.Dispatch.Purpose == bindings.CoordinatorPurpose
+}
+
+// ScratchPath is the working directory of a session without a repo: <session dir>/work.
+func ScratchPath(sessionDir string) string { return filepath.Join(sessionDir, "work") }
 
 func mcpURL(s dispatch.Session) string {
 	if s.Accepted.MCPURL != "" {

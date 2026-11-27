@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/collies-ai/collie-agent/internal/bindings"
 	"github.com/collies-ai/collie-agent/internal/machine"
 )
 
@@ -24,7 +25,7 @@ type Launch struct {
 	Prompt         string
 	MCPURL         string
 	PermissionMode string // the binding's mode: auto, full or plan
-	Purpose        string // the dispatch's purpose: code, research, reviewer or qa-browser
+	Purpose        string // the dispatch's purpose: code, research, reviewer, qa-browser or coordinator
 	Binary         string // the agent CLI's resolved path
 	// TokenEnv is the environment variable that holds the session token: adapters reference it and never write the
 	// token itself to a file or a command line, where other users could read it.
@@ -258,7 +259,11 @@ func (Claude) Command(l Launch) (Command, error) {
 		return Command{}, fmt.Errorf("writing the MCP config: %w", err)
 	}
 	settingsPath := filepath.Join(l.SessionDir, "settings.json")
-	if err := writeJSON(settingsPath, claudeSettings(l.SessionDir)); err != nil {
+	settings := claudeSettings(l.SessionDir)
+	if l.Purpose == bindings.CoordinatorPurpose {
+		settings = claudeCoordinatorSettings
+	}
+	if err := writeJSON(settingsPath, settings); err != nil {
 		return Command{}, fmt.Errorf("writing the settings: %w", err)
 	}
 	var env []string
@@ -269,6 +274,9 @@ func (Claude) Command(l Launch) (Command, error) {
 			return Command{}, fmt.Errorf("writing the presence file: %w", err)
 		}
 		env = append(env, "CLAUDE_CLIENT_PRESENCE_FILE="+presence)
+	}
+	if l.Purpose == bindings.CoordinatorPurpose {
+		return claudeCoordinator(l, mcpPath, settingsPath, env), nil
 	}
 	var session []string
 	switch {
@@ -294,6 +302,53 @@ func (Claude) Command(l Launch) (Command, error) {
 	}, nil
 }
 
+// claudeCoordinatorDenied are the built-in tools a coordinator session must never use: it has no repo, and it works
+// only through collie's MCP. --tools "" already removes every built-in tool; the deny rules stay as a second fence.
+var claudeCoordinatorDenied = []string{
+	"Bash", "BashOutput", "KillShell", "KillBash", "PowerShell",
+	"Read", "Edit", "MultiEdit", "Write", "NotebookEdit", "NotebookRead", "Glob", "Grep", "LS",
+	"WebFetch", "WebSearch", "Task", "Agent",
+}
+
+// claudeCoordinatorSettings turns every hook off. With the person's settings files not loaded, no hook of theirs or of
+// their plugins could run anyway; this also covers a hook from any other source. A hook would run with the session's
+// environment, session token included.
+var claudeCoordinatorSettings = map[string]any{"disableAllHooks": true}
+
+// claudeCoordinator is the command of a coordinator session: headless (`claude -p`, no terminal), so it exits when its
+// run is done instead of idling until the idle timeout, and it skips the workspace trust dialog of its scratch dir. It
+// streams JSON events, and the final result event carries the session's usage (Observe).
+//
+// It is isolated from the person's own Claude Code setup, whatever the binding's permission mode:
+//   - --setting-sources "" loads none of their settings files (user, project, local), so none of their hooks, plugins,
+//     permission rules or environment; --settings adds disableAllHooks on top. Sign-in is not a setting: the
+//     subscription's login still works;
+//   - --tools "" removes every built-in tool (shell, files, web, subagents), and the deny list repeats them;
+//   - --strict-mcp-config with an MCP config holding only collie's server, the only tools it can call, allowed with
+//     the server rule mcp__collie; anything else that would ask is refused (dontAsk where the CLI has it, -p's own
+//     refusal otherwise).
+//
+// A claude too old for these flags refuses to start, and the session ends with that exit code: it never runs with less
+// isolation.
+func claudeCoordinator(l Launch, mcpPath, settingsPath string, env []string) Command {
+	var args []string
+	if l.AgentSession != "" {
+		args = append(args, "--session-id", l.AgentSession)
+	}
+	args = append(args, "-p", "--output-format", "stream-json", "--verbose",
+		"--setting-sources", "", "--settings", settingsPath, "--tools", "")
+	if slices.Contains(claudeModes(l.Binary), "dontAsk") {
+		args = append(args, "--permission-mode", "dontAsk")
+	}
+	args = append(args,
+		"--mcp-config", mcpPath, "--strict-mcp-config",
+		"--allowedTools", "mcp__collie",
+		"--disallowedTools", strings.Join(claudeCoordinatorDenied, ","),
+		"--", l.Prompt,
+	)
+	return Command{Binary: "claude", Env: env, Args: args}
+}
+
 // claudeSettings are hooks that touch the activity file whenever the session works (a prompt, a tool) and the idle
 // file when it stops or waits for a person. Not SessionStart: a session stuck on a dialog before its first prompt
 // has done no work, and is judged by its output.
@@ -314,11 +369,57 @@ func claudeSettings(dir string) map[string]any {
 
 var claudeURL = regexp.MustCompile(`https://claude\.ai/code/session_[A-Za-z0-9_-]+`)
 
-// Observe finds the claude.ai/code link of the Remote Control session (shown as text or as a terminal hyperlink).
+// claudeResult is the part of a headless session's final stream-json event (type result) that carries its usage.
+type claudeResult struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id"`
+	Usage     *struct {
+		InputTokens              int64 `json:"input_tokens"`
+		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+		OutputTokens             int64 `json:"output_tokens"`
+	} `json:"usage"`
+	ModelUsage map[string]json.RawMessage `json:"modelUsage"`
+}
+
+// Observe finds the claude.ai/code link of the Remote Control session (shown as text or as a terminal hyperlink) and,
+// in a headless session, the usage its final result event reports. The interactive one never prints that event: it
+// reports its usage to collie itself.
 func (Claude) Observe(line string, o *Observed) {
+	// The result event is one JSON object per line; its "type" key is not always first.
+	if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "{") && strings.Contains(trimmed, `"type":"result"`) {
+		var r claudeResult
+		if json.Unmarshal([]byte(trimmed), &r) == nil && r.Type == "result" && r.Usage != nil {
+			o.Usage = &machine.Usage{
+				SessionID:                r.SessionID,
+				Model:                    mainModel(r.ModelUsage),
+				InputTokens:              r.Usage.InputTokens,
+				CacheCreationInputTokens: r.Usage.CacheCreationInputTokens,
+				CacheReadInputTokens:     r.Usage.CacheReadInputTokens,
+				OutputTokens:             r.Usage.OutputTokens,
+			}
+		}
+		return
+	}
 	if o.URL == "" {
 		o.URL = claudeURL.FindString(line)
 	}
+}
+
+// mainModel is the model of a result event's modelUsage that wrote the most output: a session also uses a small model
+// for housekeeping, which is not the one it ran on.
+func mainModel(models map[string]json.RawMessage) string {
+	best, most := "", int64(-1)
+	for name, raw := range models {
+		var u struct {
+			OutputTokens int64 `json:"outputTokens"`
+		}
+		_ = json.Unmarshal(raw, &u)
+		if u.OutputTokens > most || (u.OutputTokens == most && name < best) {
+			best, most = name, u.OutputTokens
+		}
+	}
+	return best
 }
 
 // NewSessionID is a new uuid, passed with --session-id so the session can be resumed with --resume.
@@ -349,11 +450,40 @@ func (Codex) Binary() string { return "codex" }
 // on), full has no sandbox, plan is read-only. Anything else is auto.
 var codexSandbox = map[string]string{"auto": "workspace-write", "full": "danger-full-access", "plan": "read-only"}
 
+// codexCoordinatorIsolation keeps a coordinator session (its scratch dir is no repo: --skip-git-repo-check) away from
+// the person's own Codex setup and from anything but collie's MCP:
+//   - --ignore-user-config skips $CODEX_HOME/config.toml (their MCP servers, profiles, hooks, model settings); sign-in
+//     still comes from CODEX_HOME. collie's server is then the only MCP server (-c mcp_servers.collie);
+//   - --ignore-rules skips their execpolicy rules;
+//   - --disable shell_tool removes the shell, the way to read local files. A codex that does not know it refuses to
+//     start, so the session never runs with a shell. The other tools that reach past collie (the newer exec shell,
+//     ChatGPT apps, plugins, hooks, browser and computer use, image tools, subagents, web search) are turned off with
+//     -c: a codex too old to have one ignores the setting, and has no such tool to turn off.
+var codexCoordinatorIsolation = []string{
+	"--skip-git-repo-check", "--ignore-user-config", "--ignore-rules",
+	"--disable", "shell_tool",
+	"-c", "features.unified_exec=false",
+	"-c", "features.apps=false",
+	"-c", "features.plugins=false",
+	"-c", "features.hooks=false",
+	"-c", "features.browser_use=false",
+	"-c", "features.computer_use=false",
+	"-c", "features.view_image=false",
+	"-c", "features.image_generation=false",
+	"-c", "features.multi_agent=false",
+	"-c", `web_search="disabled"`,
+}
+
 // Command builds the codex exec command line.
 func (Codex) Command(l Launch) (Command, error) {
 	sandbox, ok := codexSandbox[l.PermissionMode]
 	if !ok {
 		sandbox = codexSandbox["auto"]
+	}
+	coordinator := l.Purpose == bindings.CoordinatorPurpose
+	if coordinator {
+		// The coordinator only uses collie's MCP: whatever the binding says, nothing can be written and nothing asks.
+		sandbox = "read-only"
 	}
 	var network []string
 	if sandbox == "workspace-write" {
@@ -376,6 +506,9 @@ func (Codex) Command(l Launch) (Command, error) {
 	// `codex exec resume` takes neither --cd nor --sandbox: it runs in the worktree (the process's directory) and gets
 	// the sandbox as config.
 	head := []string{"exec", "--json", "--cd", l.Worktree, "--sandbox", sandbox}
+	if coordinator {
+		head = append(head, codexCoordinatorIsolation...)
+	}
 	if l.Resume {
 		head = []string{"exec", "resume", "--json", "-c", "sandbox_mode=\"" + sandbox + "\""}
 	}
