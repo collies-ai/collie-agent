@@ -20,7 +20,7 @@ curl -fsSL https://github.com/collies-ai/collie-agent/releases/latest/download/i
 The script picks the build for your OS and CPU, verifies its SHA-256 against the release's `checksums.txt` and
 installs `collie-agent` to `~/.local/bin` (`/usr/local/bin` as root). Set `COLLIE_AGENT_VERSION=v0.1.0` for a given
 release or `COLLIE_AGENT_INSTALL_DIR` for another directory. Running it again upgrades in place; then run
-`collie-agent service install` again so the service restarts on the new binary.
+`collie-agent service restart` so the service runs the new binary.
 
 ## Pair and run
 
@@ -55,7 +55,8 @@ without retrying. To pair again, run `collie-agent pair --force`.
 | `service install` | Installs and starts the background service (re-run it after an upgrade or a new pairing). |
 | `service uninstall` | Stops and removes it. |
 | `service status` | What launchd or systemd says about it (exit 0 when running). |
-| `roots add\|remove <folder>`, `roots list` | Manages the root folders (restart the service after a change). |
+| `service start\|stop\|restart` (or `start`, `stop`, `restart`) | Starts, stops or restarts the installed service. A stopped service starts again at the next login. |
+| `roots add\|remove <folder>`, `roots list` | Manages the root folders. A running agent picks the change up within a minute. |
 | `status` | Pairing, last heartbeat, how dispatches arrive, the sessions restored at startup, roots, discovery, repos, bindings, last error and the service. |
 | `run` | Runs in the foreground: what the service runs. |
 | `version` | Prints the version. |
@@ -247,7 +248,12 @@ chosen in collie is ignored. A pin matches a binding from collie by `runner_id`,
 (+ `purpose`), and replaces the fields it sets, its `permission_mode` included (it wins over the machine's);
 `disabled` turns that binding off on this machine. An unknown permission mode is an error, never a silent default.
 `collie-agent status` shows each binding's mode and where it comes from. A pinned folder must still be inside the root
-folders or be a discovered repo. `discover` lists the discovery sources (`claude`, `codex`); `[]` turns discovery off. Restart the service after editing it.
+folders or be a discovered repo. `discover` lists the discovery sources (`claude`, `codex`); `[]` turns discovery off.
+
+The running agent rereads `config.json` at every heartbeat (30 seconds): new root folders or discovery sources make it
+look for repos again right away, and pins and `permission_mode` apply to the bindings. `max_concurrency`,
+`session_setup` and `phone_notifications` apply after `collie-agent service restart`. A `config.json` that does not
+load is logged and the settings in use are kept.
 
 ## Develop
 

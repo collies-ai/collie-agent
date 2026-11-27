@@ -576,3 +576,37 @@ func TestStatusShowsTheRestoredSessions(t *testing.T) {
 		}
 	}
 }
+
+func TestServiceStartStopRestart(t *testing.T) {
+	h := newHarness(t, "linux")
+	if code := h.run("restart"); code == 0 || !strings.Contains(h.err.String(), "not paired") {
+		t.Errorf("restart of an unpaired profile = %d: %s", code, h.err)
+	}
+	srv := collieServer(t, nil)
+	h.run("pair", "--server", srv.URL)
+	if code := h.run("service", "restart"); code == 0 || !strings.Contains(h.err.String(), "service install") {
+		t.Errorf("restart before install = %d: %s", code, h.err)
+	}
+	if code := h.run("service", "install"); code != 0 {
+		t.Fatalf("service install = %d: %s", code, h.err)
+	}
+	h.commands = nil
+	for _, args := range [][]string{{"service", "stop"}, {"service", "start"}, {"restart"}, {"stop"}, {"start"}} {
+		if code := h.run(args...); code != 0 {
+			t.Fatalf("%v = %d: %s", args, code, h.err)
+		}
+	}
+	want := []string{
+		"systemctl --user stop collie-agent.service",
+		"systemctl --user start collie-agent.service",
+		"systemctl --user restart collie-agent.service",
+		"systemctl --user stop collie-agent.service",
+		"systemctl --user start collie-agent.service",
+	}
+	if strings.Join(h.commands, "\n") != strings.Join(want, "\n") {
+		t.Errorf("commands:\n%s", strings.Join(h.commands, "\n"))
+	}
+	if code := h.run("service", "bogus"); code != exitUsage {
+		t.Errorf("service bogus = %d", code)
+	}
+}

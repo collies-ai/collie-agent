@@ -59,7 +59,17 @@ type Manager interface {
 	Install(Spec) error
 	Uninstall() error
 	Status() (Status, error)
+	// Start starts the installed service; one already running keeps running.
+	Start() error
+	// Stop stops the service until the next login or Start. It stays installed.
+	Stop() error
+	// Restart stops the service if it runs and starts it again, so it rereads its config and binary. It does not
+	// rewrite the plist or unit: Install does that.
+	Restart() error
 }
+
+// ErrNotInstalled means start or restart found no plist or unit file.
+var ErrNotInstalled = errors.New("the service is not installed (run `collie-agent service install`)")
 
 // ErrUnsupported means the OS has no service manager collie-agent knows.
 var ErrUnsupported = errors.New("service install supports macOS (launchd) and Linux (systemd) only")

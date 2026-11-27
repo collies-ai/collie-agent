@@ -123,6 +123,42 @@ func systemdNotLoaded(_ string, err error) bool {
 	return exitCode(err) == systemdNotLoadedExit
 }
 
+// Start starts the unit; a unit already running keeps running.
+func (d *Systemd) Start() error {
+	if _, err := os.Stat(d.Path()); err != nil {
+		return ErrNotInstalled
+	}
+	if out, err := d.Run("systemctl", "--user", "start", d.Name()); err != nil {
+		return fmt.Errorf("systemctl --user start %s: %v: %s", d.Name(), err, out)
+	}
+	return nil
+}
+
+// Stop stops the unit. It stays enabled: systemd starts it again at the next login, or Start does.
+func (d *Systemd) Stop() error {
+	if out, err := d.Run("systemctl", "--user", "stop", d.Name()); err != nil {
+		if systemdNotLoaded(out, err) {
+			if _, statErr := os.Stat(d.Path()); statErr != nil {
+				return ErrNotInstalled
+			}
+			return nil
+		}
+		return fmt.Errorf("systemctl --user stop %s: %v: %s", d.Name(), err, out)
+	}
+	return nil
+}
+
+// Restart restarts the unit, or starts it when it was stopped.
+func (d *Systemd) Restart() error {
+	if _, err := os.Stat(d.Path()); err != nil {
+		return ErrNotInstalled
+	}
+	if out, err := d.Run("systemctl", "--user", "restart", d.Name()); err != nil {
+		return fmt.Errorf("systemctl --user restart %s: %v: %s", d.Name(), err, out)
+	}
+	return nil
+}
+
 // Status asks systemctl is-active about the unit.
 func (d *Systemd) Status() (Status, error) {
 	st := Status{Path: d.Path()}

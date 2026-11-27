@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"os"
+	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -92,6 +94,16 @@ type Runner struct {
 	// the sources the person allowed (config.json discover), the ones Claude Code or Codex trust.
 	FindAgents func(ctx context.Context) []machine.Agent
 	Discover   func(roots, sources []string) []discovery.Repo
+	// ReloadSettings rereads config.json; every heartbeat calls it, so a change applies without a restart. Nil keeps
+	// the Settings given at start.
+	ReloadSettings func() (*config.Settings, error)
+
+	// settingsMu guards Settings, which a reload replaces while the other loops read it.
+	settingsMu sync.RWMutex
+	// reloadErr is the last reload error logged (so a broken config.json is logged once, not every heartbeat), and
+	// restartNoted says the settings that only apply at start were changed and that was logged.
+	reloadErr    string
+	restartNoted bool
 
 	dispatcher *dispatch.Dispatcher
 	// stop ends the whole Loop with err (a revocation found anywhere, including a late ack after a reconnect).
@@ -198,10 +210,57 @@ func (r *Runner) logger() *log.Logger {
 }
 
 func (r *Runner) settings() *config.Settings {
+	r.settingsMu.RLock()
+	defer r.settingsMu.RUnlock()
 	if r.Settings != nil {
 		return r.Settings
 	}
 	return &config.Settings{}
+}
+
+// reloadSettings rereads config.json and applies what changed: root folders and discovery (the allowed folders, a
+// rescan and a bindings sync), and the pinned bindings and permission mode (a bindings sync). max_concurrency,
+// session_setup and phone_notifications are wired into the sessions at start: they keep their start values, and a
+// change to them is logged once with a hint to restart. A config.json that does not load keeps the settings in use.
+func (r *Runner) reloadSettings() {
+	if r.ReloadSettings == nil {
+		return
+	}
+	next, err := r.ReloadSettings()
+	if err != nil {
+		if msg := err.Error(); msg != r.reloadErr {
+			r.reloadErr = msg
+			r.logger().Printf("config.json: %v (keeping the settings in use)", err)
+		}
+		return
+	}
+	r.reloadErr = ""
+	prev := r.settings()
+	startOnly := prev.MaxConcurrency != next.MaxConcurrency || prev.PhoneNotifications != next.PhoneNotifications ||
+		!maps.Equal(prev.SessionSetup, next.SessionSetup)
+	if startOnly && !r.restartNoted {
+		r.logger().Print("config.json changed max_concurrency, session_setup or phone_notifications: they apply after a restart (collie-agent service restart)")
+	}
+	r.restartNoted = startOnly
+	next.MaxConcurrency, next.PhoneNotifications, next.SessionSetup = prev.MaxConcurrency, prev.PhoneNotifications, prev.SessionSetup
+	if reflect.DeepEqual(prev, next) {
+		return
+	}
+	where := !slices.Equal(prev.RootFolders, next.RootFolders) || !slices.Equal(prev.DiscoverFrom(), next.DiscoverFrom())
+	r.settingsMu.Lock()
+	r.Settings = next
+	r.settingsMu.Unlock()
+	if where {
+		r.logger().Printf("config.json changed: %d root folders %v, discovery %v: looking for repos again", len(next.RootFolders), next.RootFolders, next.DiscoverFrom())
+		r.signalRescan()
+	} else {
+		r.logger().Print("config.json changed: applying it to the bindings")
+	}
+	if r.dispatcher != nil && r.Remote != nil {
+		// The new boundary applies to offers right away; the heartbeat that follows syncs the bindings against it.
+		r.applyAllowed()
+		r.resync.Store(true)
+	}
 }
 
 func (r *Runner) maxConcurrency() int {
@@ -361,6 +420,7 @@ func (r *Runner) heartbeatLoop(ctx context.Context, bound chan struct{}) error {
 	failures := 0
 	synced := ""
 	for {
+		r.reloadSettings()
 		hb := machine.Heartbeat{
 			Version:        version.Version,
 			OS:             runtime.GOOS + "/" + runtime.GOARCH,
