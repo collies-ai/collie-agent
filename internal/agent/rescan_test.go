@@ -2,11 +2,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/collies-ai/collie-agent/internal/config"
 	"github.com/collies-ai/collie-agent/internal/machine"
 )
 
@@ -159,5 +161,76 @@ func TestAFirstVersionAfterAReportRescans(t *testing.T) {
 	r2.codebasesChanged("5", false)
 	if len(r2.rescan) != 1 {
 		t.Error("a first version seen after a report did not rescan")
+	}
+}
+
+func TestARootAddedWhileRunningIsPickedUp(t *testing.T) {
+	f := newFakeCollie(t)
+	r, _, repo := setup(t, f)
+	r.Sleep = inventorySleep
+	root := r.Settings.RootFolders[0]
+	r.Settings = &config.Settings{MaxConcurrency: 3}
+	var mu sync.Mutex
+	var file *config.Settings
+	var fileErr error
+	r.ReloadSettings = func() (*config.Settings, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fileErr != nil {
+			return nil, fileErr
+		}
+		if file == nil {
+			return &config.Settings{MaxConcurrency: 3}, nil
+		}
+		c := *file
+		return &c, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Loop(ctx) }()
+	defer func() { cancel(); <-done }()
+
+	state := func() (int, int, []machine.InventoryRepo) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		roots := -1
+		if len(f.heartbeats) > 0 {
+			roots = f.heartbeats[len(f.heartbeats)-1].RootsCount
+		}
+		var last []machine.InventoryRepo
+		if len(f.inventory) > 0 {
+			last = f.inventory[len(f.inventory)-1]
+		}
+		return roots, len(f.inventory), last
+	}
+	waitFor(t, "an empty first report", func() bool { _, n, _ := state(); return n == 1 })
+	if roots, _, inv := state(); roots != 0 || len(inv) != 0 {
+		t.Fatalf("before the root: roots_count %d, inventory %v", roots, inv)
+	}
+
+	// A broken config.json keeps the settings in use.
+	mu.Lock()
+	fileErr = errors.New("unexpected end of JSON input")
+	mu.Unlock()
+	time.Sleep(50 * time.Millisecond)
+	if roots, n, _ := state(); roots != 0 || n != 1 {
+		t.Fatalf("a broken config.json changed things: roots_count %d, %d reports", roots, n)
+	}
+
+	// `roots add` writes config.json: the next heartbeat reports the root and a rescan finds the repo, without the
+	// codebases changing. max_concurrency keeps its start value.
+	mu.Lock()
+	fileErr = nil
+	file = &config.Settings{RootFolders: []string{root}, MaxConcurrency: 9}
+	mu.Unlock()
+	waitFor(t, "the repo under the new root", func() bool {
+		roots, _, inv := state()
+		return roots == 1 && len(inv) == 1 && inv[0].Path == repo
+	})
+	f.mu.Lock()
+	last := f.heartbeats[len(f.heartbeats)-1]
+	f.mu.Unlock()
+	if last.MaxConcurrency != 3 {
+		t.Errorf("max_concurrency = %d, want the start value 3", last.MaxConcurrency)
 	}
 }
